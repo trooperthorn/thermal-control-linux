@@ -1,0 +1,214 @@
+"""sysfs hwmon backend that hands fans back to firmware control on exit.
+
+The backend implements the same interface as `thermalctl.backend.Backend`. It writes
+only to headers that are both mapped and enabled by an active-mode config, and it
+records each header's original `pwmN_enable` before the first write. The originals are
+also saved to a state file, so a separate helper can restore them after the service was
+killed. If restoring the original fails, the header is set to full speed instead.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import math
+import os
+import signal
+import time
+from collections.abc import Callable, Iterable, Mapping
+from pathlib import Path
+
+from ..safety import Reading
+
+log = logging.getLogger("thermalctl.sysfs")
+
+MANUAL = 1
+FULL_PWM = 255
+
+
+class BackendError(Exception):
+    """Raised when the backend cannot start safely."""
+
+
+def duty_to_pwm(duty: float) -> int:
+    """Scale a duty percent to 0 to 255, clamping. A non-number means full speed."""
+    if not isinstance(duty, (int, float)) or math.isnan(duty):
+        return FULL_PWM
+    return max(0, min(FULL_PWM, round(duty / 100.0 * FULL_PWM)))
+
+
+def _read_text(path: str) -> str:
+    with open(path, encoding="ascii") as handle:
+        return handle.read().strip()
+
+
+def _write_int(path: str, value: int) -> None:
+    with open(path, "w", encoding="ascii", newline="\n") as handle:
+        handle.write(f"{value}\n")
+
+
+def _enable_path(pwm_path: str) -> str:
+    return pwm_path + "_enable"
+
+
+def _fan_path(pwm_path: str) -> str:
+    directory, name = os.path.split(pwm_path)
+    return os.path.join(directory, "fan" + name[len("pwm"):] + "_input")
+
+
+class SysfsBackend:
+    """Reads sensors and fans and drives pwm files, restoring firmware mode on exit.
+
+    headers maps a header id to its pwmN path. inputs maps an input name, as used in
+    zone config, to a file holding a value that is divided by input_scale (millidegrees
+    Celsius by default). mapped lists the header ids that passed the mapping test.
+    """
+
+    def __init__(
+        self,
+        headers: Mapping[str, str],
+        inputs: Mapping[str, str],
+        mapped: Iterable[str],
+        state_file: str | Path,
+        active: bool = False,
+        clock: Callable[[], float] = time.time,
+        input_scale: float = 1000.0,
+    ) -> None:
+        self.headers = dict(headers)
+        self.inputs = dict(inputs)
+        self.mapped = set(mapped) & set(self.headers)
+        self.state_file = Path(state_file)
+        self.active = active
+        self.clock = clock
+        self.input_scale = input_scale
+        self.originals: dict[str, int] = {}
+        self.restore_failures: list[str] = []
+        self.started = False
+
+    def _controlled(self, header_id: str) -> bool:
+        return self.active and header_id in self.mapped and header_id in self.originals
+
+    # Lifecycle -------------------------------------------------------------------
+
+    def start(self) -> None:
+        """Record originals, persist them, then set manual mode on mapped headers."""
+        if self.started:
+            return
+        self.started = True
+        if not self.active:
+            return
+        try:
+            for header_id in sorted(self.mapped):
+                value = int(_read_text(_enable_path(self.headers[header_id])))
+                self.originals[header_id] = value
+            self._save_state()
+            for header_id in sorted(self.originals):
+                _write_int(_enable_path(self.headers[header_id]), MANUAL)
+        except (OSError, ValueError) as exc:
+            self.restore()
+            raise BackendError(f"cannot take control of fans: {exc}") from exc
+
+    def restore(self) -> None:
+        """Restore every recorded pwmN_enable, or write full speed when that fails."""
+        self.restore_failures = []
+        for header_id, original in self.originals.items():
+            pwm = self.headers[header_id]
+            try:
+                _write_int(_enable_path(pwm), original)
+            except OSError as exc:
+                log.error("restore of %s failed (%s); writing full speed", header_id, exc)
+                self.restore_failures.append(header_id)
+                try:
+                    _write_int(pwm, FULL_PWM)
+                except OSError as exc2:
+                    log.error("full speed write to %s failed: %s", header_id, exc2)
+        if not self.restore_failures:
+            self.originals = {}
+            try:
+                self.state_file.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                log.error("cannot remove state file: %s", exc)
+        self.started = False
+
+    def __enter__(self) -> "SysfsBackend":
+        self.start()
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.restore()
+
+    def _save_state(self) -> None:
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "headers": {h: self.headers[h] for h in self.originals},
+            "originals": self.originals,
+        }
+        tmp = self.state_file.with_name(self.state_file.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(data, handle, sort_keys=True)
+            handle.write("\n")
+        os.replace(tmp, self.state_file)
+
+    # Backend interface -----------------------------------------------------------
+
+    def read_inputs(self) -> Mapping[str, Reading]:
+        """Return a reading per input; an unreadable input has value None."""
+        now = self.clock()
+        result: dict[str, Reading] = {}
+        for name, path in self.inputs.items():
+            try:
+                result[name] = Reading(float(_read_text(path)) / self.input_scale, now)
+            except (OSError, ValueError):
+                result[name] = Reading(None, None)
+        return result
+
+    def read_rpm(self, header_id: str) -> float | None:
+        path = self.headers.get(header_id)
+        if path is None:
+            return None
+        try:
+            return float(_read_text(_fan_path(path)))
+        except (OSError, ValueError):
+            return None
+
+    def write_duty(self, header_id: str, duty: float) -> None:
+        if not self._controlled(header_id):
+            return
+        _write_int(self.headers[header_id], duty_to_pwm(duty))
+
+    def release(self, header_id: str) -> None:
+        """Hand one header back to its original mode, or full speed if that fails."""
+        if not self._controlled(header_id):
+            return
+        pwm = self.headers[header_id]
+        try:
+            _write_int(_enable_path(pwm), self.originals[header_id])
+        except OSError:
+            _write_int(pwm, FULL_PWM)
+
+
+def install_signal_handlers() -> None:
+    """Turn SIGTERM and SIGINT into SystemExit so the context manager restores."""
+
+    def handler(signum: int, frame: object) -> None:
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, handler)
+    signal.signal(signal.SIGINT, handler)
+
+
+def restore_from_state_file(state_file: str | Path) -> list[str]:
+    """Restore originals saved by a killed service. Returns header ids that fell back."""
+    path = Path(state_file)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        headers = data["headers"]
+        originals = {h: int(v) for h, v in data["originals"].items()}
+    except (OSError, ValueError, KeyError, AttributeError):
+        return []
+    backend = SysfsBackend(headers, {}, headers.keys(), path, active=True)
+    backend.originals = originals
+    backend.restore()
+    return backend.restore_failures

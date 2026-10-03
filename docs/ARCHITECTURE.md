@@ -139,3 +139,23 @@ paths, floors, zones or curves is logged to `thermalctl.audit` with old and new 
 is every header state change. `shutdown()` latches failsafe and writes the final status.
 The hold period, EMA alpha, hysteresis, ramp rate and firmware-mode flag are constructor
 arguments; config keys for them and the CLI wiring are still to do.
+
+### sysfs backend implementation
+
+`thermalctl/backends/sysfs.py` implements the `Backend` interface over hwmon files. It is
+given the pwm path of each header, a map from input names to files, the ids of mapped
+headers, a state file path and whether the config mode is active. Temperature files are
+read as millidegrees and divided by a scale. An unreadable or non-numeric input becomes a
+reading with no value, which the safety machine treats as a missing input. An unreadable
+fan file gives an RPM of None.
+
+On `start()` in active mode it reads `pwmN_enable` for every mapped header, saves the
+originals to the state file with an atomic rename, and only then writes manual mode. In
+dry run, or for an unmapped header, it never writes anything. `write_duty` scales the duty
+percent to 0 to 255, clamps it, and treats a non-number as full speed. `restore()` writes
+each recorded original back; if that write fails it writes 255 to the pwm file instead,
+and it keeps the state file when any header fell back. The backend is a context manager so
+normal exit and exceptions restore, and `install_signal_handlers()` turns SIGTERM and
+SIGINT into `SystemExit` so they restore too. After a SIGKILL, `restore_from_state_file()`
+applies the saved originals, and is meant to be called by the `ExecStopPost` helper. The
+wiring of the backend into the CLI and the systemd unit is still to do.
