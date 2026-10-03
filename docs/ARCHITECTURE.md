@@ -81,3 +81,25 @@ problem, which the controller treats as a fail-safe cause. The top level holds `
 The zone duty is the larger of the temperature and load curve values. `docs/example.toml`
 is a documented MediaIn-SVR example whose paths are unverified placeholders.
 
+### Fail-safe and smoothing implementation
+
+`thermalctl/safety.py` holds one `HeaderSafety` per header. Each cycle it receives the
+zone readings (value and timestamp), the fan RPM, the duty last commanded and whether the
+config is valid. A header is `active` only when the config mode enables it and the header
+is mapped; otherwise it is `dry_run`. Any cause moves it to `failsafe` in the same cycle,
+and the reasons are recorded as `kind:name` strings such as `stale_input:temp1`. Causes
+are: missing, non-numeric or non-finite input, a timestamp older than `stale_after_s` or
+in the future, a temperature above `hard_max_temp_c`, an unreadable RPM, 0 RPM while the
+commanded duty is above `min_duty` for longer than `stall_window_s`, invalid config, and
+exit. Exit latches. For every other cause the header leaves failsafe only after all
+causes have been clear for the hold period, and a new cause restarts that period.
+`failsafe_duty` returns 100, or 0 meaning firmware control when that mode is configured.
+
+`thermalctl/smoothing.py` provides `Ema` for inputs, `OutputShaper` for output and
+`apply_floor`. The shaper follows a rising target at once. A falling target is ignored
+while it is within the hysteresis band, and otherwise the duty falls no faster than the
+ramp limit, never below the target. `apply_floor` keeps duty at or above the header
+minimum and passes an explicit 0 only in failsafe-to-firmware mode. The hold period,
+hysteresis, ramp rate and EMA alpha are constructor arguments here; wiring them to the
+config belongs to the controller slice.
+
