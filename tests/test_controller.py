@@ -1,4 +1,6 @@
 import json
+
+import pytest
 import logging
 
 from thermalctl.backend import FakeBackend
@@ -250,3 +252,35 @@ def test_failsafe_on_one_header_keeps_other_header_smoothing(tmp_path):
     ema.update(70.0)
     rig.ctl._failsafe_header(rig.ctl.config.headers[0])
     assert ema.value is None
+
+
+def test_first_cycle_warms_up_load_then_second_cycle_uses_it(tmp_path):
+    rig = Rig(tmp_path)
+    rig.set_inputs(50.0, 100.0)
+    warm = Reading(None, None, warming_up=True)
+
+    def cycle(load_reading):
+        rig.now += 1.0
+        rig.backend.inputs = {"temp": Reading(50.0, rig.now), "load": load_reading}
+        return rig.ctl.cycle()
+
+    doc = cycle(warm)
+    header = doc["headers"]["pwm1"]
+    assert header["state"] == "active" and header["reasons"] == []
+    assert header["notes"] == ["load_warming_up"]
+    assert header["duty"] == pytest.approx(40.0)  # temperature curve alone at 50 C
+    doc = cycle(Reading(100.0, rig.now))
+    header = doc["headers"]["pwm1"]
+    assert header["state"] == "active" and header["notes"] == []
+    assert header["duty"] == 100.0  # load curve now wins
+
+
+@pytest.mark.parametrize("temp", [0.0, -40.0, 200.0])
+def test_implausible_temperature_forces_failsafe(tmp_path, temp):
+    rig = Rig(tmp_path)
+    rig.cycle()
+    rig.set_inputs(temp, 10.0)
+    doc = rig.cycle()
+    assert doc["headers"]["pwm1"]["state"] == "failsafe"
+    assert "invalid_input:temp" in doc["headers"]["pwm1"]["reasons"]
+    assert rig.backend.writes[-1] == ("pwm1", 100.0)

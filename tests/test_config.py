@@ -106,6 +106,16 @@ CASES = {
     "hard max out of range": zone_update(hard_max_temp_c=999),
     "staleness zero": zone_update(stale_after_s=0),
     "missing temperature input": lambda d: d["zones"][0].pop("temperature_input"),
+    "decreasing temp duty": zone_update(temperature_curve=[[40, 50], [60, 30], [80, 100]]),
+    "decreasing load duty": zone_update(load_curve=[[0, 40], [50, 10], [90, 100]]),
+    "temp curve below 100 at hard max": zone_update(
+        temperature_curve=[[40, 20], [80, 99]], hard_max_temp_c=90
+    ),
+    "temp curve reaches 100 only above hard max": zone_update(
+        temperature_curve=[[40, 20], [95, 100]], hard_max_temp_c=90
+    ),
+    "plausible range inverted": zone_update(plausible_min_c=50, plausible_max_c=40),
+    "hard max above plausible max": zone_update(plausible_max_c=85),
     "unknown zone reference": header_update(zones=["nope"]),
     "empty zone list": header_update(zones=[]),
     "min duty above 100": header_update(min_duty=101),
@@ -136,3 +146,18 @@ def test_invalid_toml(tmp_path):
 def test_missing_file(tmp_path):
     with pytest.raises(ConfigError):
         load_config(tmp_path / "absent.toml")
+
+
+def test_flat_curve_segments_and_hard_max_exactly_at_100_percent_are_accepted():
+    data = mutated(
+        zone_update(temperature_curve=[[40, 20], [60, 20], [90, 100]], hard_max_temp_c=90)
+    )
+    assert parse_config(data).zones[0].temperature_curve[-1] == (90.0, 100.0)
+
+
+def test_plausible_range_defaults_and_is_configurable():
+    zone = parse_config(copy.deepcopy(GOOD)).zones[0]
+    assert (zone.plausible_min_c, zone.plausible_max_c) == (-20.0, 150.0)
+    data = mutated(zone_update(plausible_min_c=-10, plausible_max_c=120))
+    zone = parse_config(data).zones[0]
+    assert (zone.plausible_min_c, zone.plausible_max_c) == (-10.0, 120.0)

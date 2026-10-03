@@ -22,7 +22,7 @@ from . import __version__
 from .backend import Backend
 from .config import Config, ConfigError, Header, load_config
 from .curves import zone_duty
-from .safety import FAILSAFE, HeaderSafety, Reading, failsafe_duty
+from .safety import FAILSAFE, LOAD_WARMING_UP, HeaderSafety, Reading, failsafe_duty
 from .smoothing import Ema, OutputShaper, apply_floor
 
 DEFAULT_STATUS_PATH = "/run/thermalctl/status.json"
@@ -124,6 +124,7 @@ class Controller:
         self.emas: dict[tuple[str, str], Ema] = {}
         self.commanded: dict[str, float | None] = {}
         self.duty: dict[str, float] = {}
+        self.notes: dict[str, list[str]] = {}
         self.last_time: float | None = None
         self._build(config)
         for line in describe_changes(None, config):
@@ -207,6 +208,7 @@ class Controller:
     # -- one cycle ----------------------------------------------------------------
 
     def _header_duty(self, header: Header, readings: dict[str, Reading], dt: float) -> float:
+        warming = False
         zones = {z.id: z for z in self.config.zones}
         target = 0.0
         for zid in header.zones:
@@ -215,9 +217,12 @@ class Controller:
                 readings[zone.temperature_input].value
             )
             load = None
-            if zone.load_input is not None:
+            if zone.load_input is not None and readings[zone.load_input].warming_up:
+                warming = True
+            elif zone.load_input is not None:
                 load = self.emas[(zid, zone.load_input)].update(readings[zone.load_input].value)
             target = max(target, zone_duty(zone.temperature_curve, temp, zone.load_curve, load))
+        self.notes[header.id] = [LOAD_WARMING_UP] if warming else []
         shaped = self.shapers[header.id].apply(target, dt)
         return apply_floor(shaped, header.min_duty)
 
@@ -233,6 +238,7 @@ class Controller:
                 if name is not None and (zone.id, name) in self.emas:
                     self.emas[(zone.id, name)].reset()
         self.duty[header.id] = duty
+        self.notes[header.id] = []
         self.commanded[header.id] = duty or None
         if self._enabled(header):
             try:
@@ -323,6 +329,7 @@ class Controller:
                     "duty": self.duty.get(h.id),
                     "rpm": _finite(rpms.get(h.id)),
                     "reasons": list(self.safety[h.id].reasons),
+                    "notes": list(self.notes.get(h.id, [])),
                     "last_change": self.safety[h.id].last_change,
                     "zones": list(h.zones),
                 }

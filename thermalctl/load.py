@@ -42,12 +42,15 @@ class LoadBackend:
         self.clock = clock
         self._last: tuple[float, float] | None = None
         self._value: float | None = None
+        self._errored = False
+        self._reads = 0
         self._sample()  # Prime, so the first cycle already has a delta to work with.
 
     def _sample(self) -> None:
         try:
             busy, total = read_cpu_times(self.proc_stat)
         except (OSError, ValueError, IndexError):
+            self._errored = True
             self._last = None
             self._value = None
             return
@@ -60,7 +63,12 @@ class LoadBackend:
     def read_inputs(self) -> Mapping[str, Reading]:
         result = dict(self.inner.read_inputs())
         self._sample()
-        if self._value is None:
+        self._reads += 1
+        if self._reads == 1 and not self._errored:
+            # The first cycle reuses no delta, so the controller works from temperature
+            # alone. This is warm-up, not a fault.
+            result[LOAD_INPUT] = Reading(None, None, warming_up=True)
+        elif self._value is None:
             result[LOAD_INPUT] = Reading(None, None)
         else:
             result[LOAD_INPUT] = Reading(self._value, self.clock())

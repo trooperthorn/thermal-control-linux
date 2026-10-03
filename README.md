@@ -12,7 +12,7 @@ measured are listed in `UNVERIFIED.md`.
   says `mode = "active"`, and even then it writes only to headers marked `mapped = true`.
 - `thermalctl status` prints the status file the service writes. `--json` prints it raw.
   It exits non-zero when the file is missing or older than `--max-age` seconds.
-- `thermalctl check-config PATH` validates a config file and changes nothing.
+- `thermalctl check-config PATH` validates a config file and changes nothing. It rejects curves whose duty falls as the input rises and temperature curves that do not reach 100 percent at or below `hard_max_temp_c`.
 - `thermalctl restore` reads the persisted original fan modes and puts them back. The
   systemd unit runs it as `ExecStopPost`, so it also runs after the service was killed.
   It writes full speed (pwm 255) to each header before restoring its mode, so a header

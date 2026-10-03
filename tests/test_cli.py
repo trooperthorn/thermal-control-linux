@@ -337,9 +337,21 @@ def test_load_backend_reports_busy_share(tmp_path):
     assert reading.timestamp == 7.0
 
 
+def test_load_backend_first_read_is_warming_up_then_uses_delta(tmp_path):
+    proc = write_proc_stat(tmp_path, 100, 900)
+    backend = LoadBackend(_NoInputs(), str(proc), clock=lambda: 7.0)
+    write_proc_stat(tmp_path, 150, 950)  # a real delta exists, but the first cycle ignores it
+    first = backend.read_inputs()["cpu_load_percent"]
+    assert first.value is None and first.warming_up
+    write_proc_stat(tmp_path, 200, 1000)
+    second = backend.read_inputs()["cpu_load_percent"]
+    assert second.value == pytest.approx(50.0) and not second.warming_up
+
+
 def test_load_backend_missing_proc_stat_gives_no_value(tmp_path):
     backend = LoadBackend(_NoInputs(), str(tmp_path / "nope"))
-    assert backend.read_inputs()["cpu_load_percent"].value is None
+    reading = backend.read_inputs()["cpu_load_percent"]
+    assert reading.value is None and not reading.warming_up  # a fault, not warm-up
 
 
 @pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="needs unix sockets")

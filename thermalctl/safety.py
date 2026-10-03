@@ -25,6 +25,8 @@ STALE_INPUT = "stale_input"
 OVER_TEMP = "over_temp"
 STALL = "stall"
 LOW_RPM = "low_rpm"
+LOAD_WARMING_UP = "load_warming_up"
+LOAD_RANGE = (0.0, 100.0)
 INVALID_CONFIG = "invalid_config"
 EXITING = "exiting"
 
@@ -35,6 +37,8 @@ class Reading:
 
     value: float | None
     timestamp: float | None
+    # True only for a load reading that has no delta yet, so it is not a fault.
+    warming_up: bool = False
 
 
 def _number_ok(value: object) -> bool:
@@ -46,11 +50,24 @@ def _number_ok(value: object) -> bool:
 
 
 def _check_reading(
-    name: str, reading: Reading | None, now: float, stale_after_s: float
+    name: str,
+    reading: Reading | None,
+    now: float,
+    stale_after_s: float,
+    plausible: tuple[float, float],
+    reject_zero: bool = False,
 ) -> list[str]:
+    if reading is not None and reading.warming_up and reading.value is None:
+        return []
     if reading is None or reading.value is None or reading.timestamp is None:
         return [f"{MISSING_INPUT}:{name}"]
     if not _number_ok(reading.value) or not _number_ok(reading.timestamp):
+        return [f"{INVALID_INPUT}:{name}"]
+    # An implausible value is a sensor fault, not a measurement, so it is never smoothed
+    # or used. An exact 0.0 from a hwmon temperature file is what a dead sensor reads.
+    if not plausible[0] <= reading.value <= plausible[1] or (
+        reject_zero and reading.value == 0.0
+    ):
         return [f"{INVALID_INPUT}:{name}"]
     age = now - reading.timestamp
     # A timestamp in the future means the clock or the reader is wrong, so it counts as stale.
@@ -66,13 +83,24 @@ def input_causes(
     causes: list[str] = []
     for zone in zones:
         temp = readings.get(zone.temperature_input)
-        found = _check_reading(zone.temperature_input, temp, now, zone.stale_after_s)
+        found = _check_reading(
+            zone.temperature_input,
+            temp,
+            now,
+            zone.stale_after_s,
+            (zone.plausible_min_c, zone.plausible_max_c),
+            reject_zero=True,
+        )
         causes += found
         if not found and temp.value > zone.hard_max_temp_c:
             causes.append(f"{OVER_TEMP}:{zone.id}")
         if zone.load_input is not None:
             causes += _check_reading(
-                zone.load_input, readings.get(zone.load_input), now, zone.stale_after_s
+                zone.load_input,
+                readings.get(zone.load_input),
+                now,
+                zone.stale_after_s,
+                LOAD_RANGE,
             )
     return causes
 

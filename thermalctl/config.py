@@ -16,6 +16,7 @@ from .curves import Point
 MODES = ("dry_run", "active")
 TEMP_RANGE = (-50.0, 150.0)
 LOAD_RANGE = (0.0, 100.0)
+DEFAULT_PLAUSIBLE_TEMP = (-20.0, 150.0)
 
 
 class ConfigError(ValueError):
@@ -31,6 +32,8 @@ class Zone:
     stale_after_s: float
     load_input: str | None = None
     load_curve: tuple[Point, ...] | None = None
+    plausible_min_c: float = DEFAULT_PLAUSIBLE_TEMP[0]
+    plausible_max_c: float = DEFAULT_PLAUSIBLE_TEMP[1]
 
 
 @dataclass(frozen=True)
@@ -90,6 +93,12 @@ def _curve(raw: object, where: str, x_range: tuple[float, float]) -> tuple[Point
         y = _duty(item[1], f"{name} duty")
         if points and x <= points[-1][0]:
             raise ConfigError(f"{where} points must be sorted by strictly increasing input")
+        # A fan must never slow down as the input rises, so duty may only stay or climb.
+        if points and y < points[-1][1]:
+            raise ConfigError(
+                f"{name} duty {y:g} is lower than the previous point; "
+                "duty must not decrease as the input rises"
+            )
         points.append((x, y))
     return tuple(points)
 
@@ -115,18 +124,38 @@ def _zone(table: object, index: int) -> Zone:
     hard_max = _number(table.get("hard_max_temp_c"), f"{where}: hard_max_temp_c")
     if not TEMP_RANGE[0] <= hard_max <= TEMP_RANGE[1]:
         raise ConfigError(f"{where}: hard_max_temp_c is outside the allowed range")
+    temperature_curve = _curve(
+        table.get("temperature_curve"), f"{where} temperature_curve", TEMP_RANGE
+    )
+    plausible_min = _number(
+        table.get("plausible_min_c", DEFAULT_PLAUSIBLE_TEMP[0]), f"{where}: plausible_min_c"
+    )
+    plausible_max = _number(
+        table.get("plausible_max_c", DEFAULT_PLAUSIBLE_TEMP[1]), f"{where}: plausible_max_c"
+    )
+    if plausible_min >= plausible_max:
+        raise ConfigError(f"{where}: plausible_min_c must be below plausible_max_c")
+    if hard_max > plausible_max:
+        raise ConfigError(f"{where}: hard_max_temp_c is above plausible_max_c")
+    # The hottest allowed temperature must already mean full speed, so the curve has to
+    # reach 100 percent at or below it; duty is non-decreasing, so one point is enough.
+    if not any(x <= hard_max and y >= 100.0 for x, y in temperature_curve):
+        raise ConfigError(
+            f"{where}: temperature_curve must reach 100 percent at or below "
+            f"hard_max_temp_c ({hard_max:g})"
+        )
     return Zone(
         id=zid,
         temperature_input=_string(table, "temperature_input", where),
-        temperature_curve=_curve(
-            table.get("temperature_curve"), f"{where} temperature_curve", TEMP_RANGE
-        ),
+        temperature_curve=temperature_curve,
         hard_max_temp_c=hard_max,
         stale_after_s=_positive(table, "stale_after_s", where),
         load_input=load_input,
         load_curve=None
         if load_raw is None
         else _curve(load_raw, f"{where} load_curve", LOAD_RANGE),
+        plausible_min_c=plausible_min,
+        plausible_max_c=plausible_max,
     )
 
 

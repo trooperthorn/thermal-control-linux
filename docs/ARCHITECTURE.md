@@ -24,6 +24,9 @@ says so. It is entered when any of these hold:
 
 - a zone input is missing, unreadable, not a number, or older than its staleness limit;
 - a temperature exceeds the zone's hard maximum;
+- a temperature reading is implausible: outside the zone's plausible range (default -20
+  to 150 C) or exactly 0.0, which is what a dead hwmon sensor reports, or a load reading
+  is outside 0 to 100 percent (reason `invalid_input:<name>`);
 - a header commanded above 0 percent, including at its floor, reports 0 RPM for longer
   than the stall window;
 - a header with a non-zero `min_rpm` reports less than that for longer than the stall
@@ -76,8 +79,13 @@ problem, which the controller treats as a fail-safe cause. The top level holds `
 - A header has `id`, `path`, `mapped` (default false), `min_duty`, `min_rpm`,
   `stall_window_s`, `zones`, a list of zone ids that must exist, and optionally
   `min_rpm_duty` (default 50), the commanded duty from which `min_rpm` is enforced.
+- A zone may set `plausible_min_c` and `plausible_max_c` (defaults -20 and 150). Readings
+  outside them are treated as sensor faults. `hard_max_temp_c` may not exceed the
+  plausible maximum.
 - Curves are lists of `[input, duty]` pairs with at least two points and strictly
-  increasing input. Temperature inputs must lie in -50 to 150 C, load inputs in 0 to 100
+  increasing input. Duty must never decrease as input rises. A temperature curve must
+  reach 100 percent at or below `hard_max_temp_c`, so the hottest allowed temperature
+  already means full speed. Temperature inputs must lie in -50 to 150 C, load inputs in 0 to 100
   percent, and every duty in 0 to 100.
 - Ids are unique within zones and within headers.
 
@@ -175,7 +183,11 @@ CLI and the systemd unit use it as described below.
 loads the config, builds the sysfs backend (temperature inputs are the file paths named
 by the zones, and only mapped headers are controlled in active mode), wraps it with the
 CPU load reader from `thermalctl/load.py`, and runs the controller. The load input is
-published as `cpu_load_percent`, computed from `/proc/stat`; any other `load_input` name
+published as `cpu_load_percent`, computed from `/proc/stat`. The first read after start
+carries no delta, so it is flagged `warming_up` instead of missing; the controller then
+computes from temperature alone, lists `load_warming_up` in that header's `notes` in the
+status file, and does not enter failsafe. From the second cycle the load is used. A load
+that cannot be read after that is still a missing input; any other `load_input` name
 is rejected by `check-config` and `run`. An invalid config at start leaves every fan
 untouched under firmware control and exits 1. `status` prints the status file and exits
 1 when it is missing or older than `--max-age`. `check-config PATH` validates only.

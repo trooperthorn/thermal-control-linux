@@ -64,6 +64,38 @@ def test_input_causes(readings, reason):
     assert reason in m.reasons
 
 
+@pytest.mark.parametrize(
+    "temp,load,reason",
+    [
+        (0.0, 10.0, "invalid_input:temp"),
+        (-40.0, 10.0, "invalid_input:temp"),
+        (200.0, 10.0, "invalid_input:temp"),
+        (50.0, -1.0, "invalid_input:load"),
+        (50.0, 100.5, "invalid_input:load"),
+    ],
+)
+def test_implausible_readings_are_invalid(temp, load, reason):
+    m = machine()
+    assert step(m, 0, good(0, temp, load)) == FAILSAFE
+    assert reason in m.reasons
+
+
+def test_load_zero_and_plausible_edges_are_fine():
+    for temp, load in ((-20.0, 0.0), (150.0, 100.0), (0.5, 0.0)):
+        zone = replace(ZONE, hard_max_temp_c=150.0)
+        m = machine()
+        state = m.update(
+            0, zones=[zone], readings=good(0, temp, load), rpm=900.0, commanded=50.0
+        )
+        assert state == ACTIVE
+
+
+def test_warming_up_load_is_not_a_fault():
+    m = machine()
+    readings = {"temp": Reading(50.0, 0), "load": Reading(None, None, warming_up=True)}
+    assert step(m, 0, readings) == ACTIVE
+
+
 def test_future_timestamp_is_stale():
     m = machine()
     readings = {"temp": Reading(50.0, 100.0), "load": Reading(1.0, 0)}
