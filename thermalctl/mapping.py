@@ -149,8 +149,8 @@ def stall_plan_lines() -> list[str]:
     return [
         f"Stall search: each mapped header steps down from {STALL_START:g} percent in "
         f"{STALL_STEP:g} percent steps to {STALL_LOWEST:g}, waiting at each step.",
-        f"A fan reading below {STALL_RPM:g} RPM counts as stopped; it is set straight back to "
-        "full speed, then stepped up from the stop point to find the duty that restarts it.",
+        f"A fan reading below {STALL_RPM:g} RPM counts as stopped; from rest it is then "
+        "stepped up to find the duty that restarts it, and left at full speed afterwards.",
         "The original mode is restored after each header, and on any exit.",
     ]
 
