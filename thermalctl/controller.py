@@ -22,6 +22,7 @@ from . import __version__
 from .backend import Backend
 from .config import Config, ConfigError, Header, load_config
 from .curves import zone_duty
+from .hwmon import HwmonError
 from .safety import FAILSAFE, LOAD_WARMING_UP, HeaderSafety, Reading, failsafe_duty
 from .smoothing import Ema, OutputShaper, apply_floor
 
@@ -222,7 +223,7 @@ class Controller:
             new = load_config(path)
             if self.config_transform is not None:
                 new = self.config_transform(new)
-        except Exception as exc:
+        except (ConfigError, HwmonError) as exc:
             audit.error("config reload rejected, failsafe stays in force: %s", exc)
             self.config_valid = False
             return False
@@ -283,6 +284,9 @@ class Controller:
                 if duty == 0.0:
                     self.backend.release(header.id)
                 else:
+                    # Another tool may have switched the chip to an automatic mode, which
+                    # can ignore pwm writes, so take manual mode back before full speed.
+                    self.backend.retake(header.id)
                     self.backend.write_duty(header.id, duty)
             except Exception:
                 log.exception("failsafe write failed for %s", header.id)
@@ -323,6 +327,9 @@ class Controller:
                 if self.safety[header.id].state == FAILSAFE:
                     self._failsafe_header(header)
                     continue
+                if previous.get(header.id) == FAILSAFE and self._enabled(header):
+                    # Leaving failsafe: release() may have handed the header to firmware.
+                    self.backend.retake(header.id)
                 duty = self._header_duty(header, readings, dt)
                 self.duty[header.id] = duty
                 self.commanded[header.id] = duty

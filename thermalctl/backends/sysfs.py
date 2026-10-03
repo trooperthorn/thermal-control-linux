@@ -231,6 +231,13 @@ class SysfsBackend:
         except (OSError, ValueError):
             return False
 
+    def retake(self, header_id: str) -> None:
+        """Write manual mode again after a foreign change, so duty writes take effect."""
+        if not self._controlled(header_id):
+            return
+        _write_int(_enable_path(self.headers[header_id]), MANUAL)
+        self.expected[header_id] = MANUAL
+
     def release(self, header_id: str) -> None:
         """Hand one header back to its original mode, or full speed if that fails."""
         if not self._controlled(header_id):

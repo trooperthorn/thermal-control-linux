@@ -634,3 +634,15 @@ def test_map_headers_resolves_chip_names(tmp_path, capsys):
                  "--state-file", str(tmp_path / "state.json")])
     assert code == 0
     assert "hwmon4" in capsys.readouterr().out
+
+
+def test_retake_rewrites_manual_mode_after_a_foreign_change(tmp_path):
+    tree = make_tree(tmp_path)
+    config = cli.load_config(write_config(tmp_path, tree, mode="active", load=False))
+    sysfs = cli.build_backend(config, str(tmp_path / "state.json"))
+    with sysfs:
+        put(tree / "pwm1_enable", "5\n")
+        assert not sysfs.owns("pwm1")
+        sysfs.retake("pwm1")
+        assert (tree / "pwm1_enable").read_text().strip() == "1"
+        assert sysfs.owns("pwm1")

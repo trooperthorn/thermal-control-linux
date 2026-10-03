@@ -6,6 +6,7 @@ import logging
 from thermalctl.backend import FakeBackend
 from thermalctl.config import parse_config
 from thermalctl.controller import Controller
+from thermalctl.hwmon import HwmonError
 from thermalctl.safety import Reading
 
 ZONE = {
@@ -332,7 +333,7 @@ def test_failing_config_transform_rejects_the_reload(tmp_path):
     rig = Rig(tmp_path)
 
     def boom(config):
-        raise ValueError("chip gone")
+        raise HwmonError("chip gone")
 
     rig.ctl.config_transform = boom
     assert rig.ctl.reload(_write_reload(tmp_path, _reload_text("active", "true"))) is False
@@ -352,3 +353,40 @@ def test_external_change_puts_a_header_in_failsafe_and_recovers_after_the_hold(t
     for _ in range(10):
         doc = rig.cycle()
     assert doc["headers"]["pwm1"]["state"] == "active"
+
+
+def test_failsafe_takes_manual_mode_back_before_full_speed(tmp_path):
+    rig = Rig(tmp_path)
+    rig.set_inputs(30.0, 0.0)
+    rig.cycle()
+    rig.backend.foreign = {"pwm1"}
+    rig.cycle()
+    assert "pwm1" in rig.backend.retakes
+    assert rig.backend.writes[-1] == ("pwm1", 100.0)
+
+
+def test_leaving_failsafe_takes_manual_mode_back(tmp_path):
+    rig = Rig(tmp_path)
+    rig.set_inputs(30.0, 0.0)
+    rig.cycle()
+    rig.backend.foreign = {"pwm1"}
+    rig.cycle()
+    rig.backend.retakes.clear()
+    rig.backend.foreign = set()
+    for _ in range(10):
+        doc = rig.cycle()
+        if doc["headers"]["pwm1"]["state"] == "active":
+            break
+    assert doc["headers"]["pwm1"]["state"] == "active"
+    assert set(rig.backend.retakes) == {"pwm1"}
+
+
+def test_reload_does_not_hide_programming_errors(tmp_path):
+    rig = Rig(tmp_path)
+
+    def boom(config):
+        raise ValueError("bug")
+
+    rig.ctl.config_transform = boom
+    with pytest.raises(ValueError):
+        rig.ctl.reload(_write_reload(tmp_path, _reload_text("dry_run", "true")))

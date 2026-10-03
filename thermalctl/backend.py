@@ -28,6 +28,9 @@ class Backend(Protocol):
     def owns(self, header_id: str) -> bool:
         """False when something else changed the header's mode since this service set it."""
 
+    def retake(self, header_id: str) -> None:
+        """Write manual mode again, so the chip accepts duty writes after a foreign change."""
+
 
 class FakeBackend:
     """In-memory backend. Set inputs, rpms and fail_reads to script a test."""
@@ -38,6 +41,7 @@ class FakeBackend:
         self.fail_reads = False
         self.writes: list[tuple[str, float]] = []
         self.releases: list[str] = []
+        self.retakes: list[str] = []
         self.foreign: set[str] = set()
 
     def read_inputs(self) -> Mapping[str, Reading]:
@@ -56,3 +60,7 @@ class FakeBackend:
 
     def owns(self, header_id: str) -> bool:
         return header_id not in self.foreign
+
+    def retake(self, header_id: str) -> None:
+        self.retakes.append(header_id)
+        self.foreign.discard(header_id)
