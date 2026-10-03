@@ -13,6 +13,7 @@ import json
 import logging
 import math
 import os
+import tempfile
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -32,15 +33,28 @@ log = logging.getLogger("thermalctl")
 
 
 def write_status_atomic(path: str | Path, document: dict) -> None:
-    """Write JSON to a temp file in the same directory, then rename over the target."""
+    """Write JSON to a uniquely named temp file beside the target, then rename over it.
+
+    On any failure the temp file is removed and the previous target is left intact.
+    """
     target = Path(path)
-    temp = target.with_name(target.name + ".tmp")
-    with open(temp, "w", encoding="utf-8", newline="\n") as handle:
-        json.dump(document, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temp, target)
+    descriptor, temp_name = tempfile.mkstemp(
+        dir=target.parent, prefix=target.name + ".", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(document, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temp_name, 0o644)
+        os.replace(temp_name, target)
+    except BaseException:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
 
 
 def describe_changes(old: Config | None, new: Config) -> list[str]:
@@ -141,6 +155,36 @@ class Controller:
                 if name is not None:
                     self.emas.setdefault((zone.id, name), Ema(self.ema_alpha))
 
+    def _release_dropped(self, old: Config, new: Config) -> None:
+        """Hand back every header this controller was driving that the new config will not.
+
+        A header that was enabled under the old config but is not under the new one (dry
+        run, unmapped or removed) would otherwise stay in manual PWM at its last duty.
+        """
+        new_headers = {h.id: h for h in new.headers}
+        for header in old.headers:
+            if not (old.mode == "active" and header.mapped):
+                continue
+            kept = new_headers.get(header.id)
+            if kept is not None and new.mode == "active" and kept.mapped:
+                continue
+            duty = failsafe_duty(self.failsafe_firmware)
+            audit.warning(
+                "header %s no longer controlled, driving to %s",
+                header.id, "firmware control" if duty == 0.0 else f"{duty} percent",
+            )
+            try:
+                if duty == 0.0:
+                    self.backend.release(header.id)
+                else:
+                    self.backend.write_duty(header.id, duty)
+            except Exception:
+                log.exception("release write failed for %s", header.id)
+            self.commanded[header.id] = duty or None
+            self.duty[header.id] = duty
+            if header.id in self.shapers:
+                self.shapers[header.id].reset(100.0)
+
     def reload(self, path: str | Path) -> bool:
         """Load a config file. An invalid file keeps failsafe and the old config unused."""
         try:
@@ -154,6 +198,7 @@ class Controller:
         for line in describe_changes(self.config, new):
             audit.warning("config change: %s", line)
         if new != self.config:
+            self._release_dropped(self.config, new)
             self.config = new
             self._build(new)
         self.config_valid = True
@@ -182,6 +227,8 @@ class Controller:
         # After recovery the duty ramps down from full speed, never up from a stale value.
         self.shapers[header.id].reset(100.0)
         for zone in self.config.zones:
+            if zone.id not in header.zones:
+                continue
             for name in (zone.temperature_input, zone.load_input):
                 if name is not None and (zone.id, name) in self.emas:
                     self.emas[(zone.id, name)].reset()

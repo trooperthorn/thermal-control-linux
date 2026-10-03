@@ -122,9 +122,15 @@ continues. The next clean cycle starts the hold period, after which headers reco
 The status file is written every cycle to a temp file in the same directory and renamed
 over the target, so a reader sees the old or the new document and never a partial one. The
 path is a constructor argument defaulting to `/run/thermalctl/status.json`; a failed write
-is logged and the previous file is left in place. It holds version, timestamp, mode,
+is logged, its uniquely named temp file is removed, and the previous file is left in place.
+It holds version, timestamp, mode,
 `config_valid`, per-zone inputs and curves, and per-header state, duty, RPM, reasons and
 last change.
+
+A reload that stops controlling a header (dry run, unmapped or removed) first drives that
+header to full speed, or releases it to firmware when so configured, so it is never left
+in manual PWM at a low duty. A failsafe on one header resets only the smoothing history of
+its own zones.
 
 `Controller.reload(path)` validates a new config. An invalid file sets `config_valid` to
 false, which puts every header in failsafe with `invalid_config`, keeps the old config

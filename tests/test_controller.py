@@ -164,3 +164,89 @@ def test_shutdown_goes_full_speed_on_mapped_headers(tmp_path):
     rig.ctl.shutdown()
     assert rig.backend.writes[-1] == ("pwm1", 100.0)
     assert rig.doc()["headers"]["pwm1"]["state"] == "failsafe"
+
+
+def _reload_text(mode, mapped, with_pwm2=True):
+    zone = (
+        'mode = "' + mode + '"\n[[zones]]\nid = "cpu"\ntemperature_input = "temp"\n'
+        "temperature_curve = [[40, 20], [80, 100]]\nhard_max_temp_c = 90\nstale_after_s = 10\n"
+    )
+
+    def hdr(hid, is_mapped):
+        return (
+            '[[headers]]\nid = "' + hid + '"\npath = "/fake/' + hid + '"\nmapped = ' + is_mapped
+            + '\nmin_duty = 20\nmin_rpm = 300\nstall_window_s = 15\nzones = ["cpu"]\n'
+        )
+
+    return zone + hdr("pwm1", mapped) + (hdr("pwm2", "false") if with_pwm2 else "")
+
+
+def _low_then_reload(tmp_path, text):
+    rig = Rig(tmp_path)
+    rig.set_inputs(30.0, 0.0)
+    rig.cycle()
+    assert rig.backend.writes[-1] == ("pwm1", 20.0)
+    new = tmp_path / "new.toml"
+    new.write_text(text, encoding="utf-8", newline="\n")
+    assert rig.ctl.reload(new) is True
+    return rig
+
+
+def test_reload_to_dry_run_drives_header_to_full_speed(tmp_path):
+    rig = _low_then_reload(tmp_path, _reload_text("dry_run", "true"))
+    assert rig.backend.writes[-1] == ("pwm1", 100.0)
+    count = len(rig.backend.writes)
+    rig.cycle()
+    assert len(rig.backend.writes) == count
+
+
+def test_reload_unmapping_header_drives_it_to_full_speed(tmp_path):
+    rig = _low_then_reload(tmp_path, _reload_text("active", "false"))
+    assert rig.backend.writes[-1] == ("pwm1", 100.0)
+
+
+def test_reload_removing_header_drives_it_to_full_speed(tmp_path):
+    new_text = _reload_text("active", "false", with_pwm2=False).replace("pwm1", "pwm3")
+    rig = _low_then_reload(tmp_path, new_text)
+    assert rig.backend.writes[-1] == ("pwm1", 100.0)
+
+
+def test_reload_keeping_header_active_does_not_force_full_speed(tmp_path):
+    rig = _low_then_reload(tmp_path, _reload_text("active", "true"))
+    assert rig.backend.writes[-1] == ("pwm1", 20.0)
+
+
+def test_interrupted_json_dump_keeps_previous_file_and_no_temp(tmp_path, monkeypatch):
+    rig = Rig(tmp_path)
+    rig.cycle()
+    before = rig.status.read_text(encoding="utf-8")
+
+    def partial(document, handle, **kwargs):
+        handle.write('{"version": ')
+        raise OSError("interrupted")
+
+    monkeypatch.setattr("thermalctl.controller.json.dump", partial)
+    rig.cycle()
+    assert rig.status.read_text(encoding="utf-8") == before
+    assert [p.name for p in tmp_path.iterdir()] == ["status.json"]
+
+
+def test_failed_replace_leaves_no_temp_file(tmp_path, monkeypatch):
+    rig = Rig(tmp_path)
+    rig.cycle()
+
+    def broken(src, dst):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("thermalctl.controller.os.replace", broken)
+    rig.cycle()
+    assert [p.name for p in tmp_path.iterdir()] == ["status.json"]
+
+
+def test_failsafe_on_one_header_keeps_other_header_smoothing(tmp_path):
+    rig = Rig(tmp_path)
+    rig.cycle()
+    ema = rig.ctl.emas[("cpu", "temp")]
+    ema.update(70.0)
+    rig.ctl._failsafe_header(rig.ctl.config.headers[0])
+    assert ema.value is None
