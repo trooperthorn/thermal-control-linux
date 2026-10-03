@@ -159,6 +159,15 @@ class SysfsBackend:
             else:
                 if not full_speed_written:
                     log.error("%s restored to mode %s without a full speed write", header_id, original)
+                    if original == 1:
+                        # A manual original keeps whatever duty is in pwmN, which would be the
+                        # last low value. Try full speed once more; if that also fails, keep the
+                        # state file so the restore helper retries instead of reporting success.
+                        try:
+                            _write_int(pwm, FULL_PWM)
+                        except OSError as exc:
+                            log.error("%s left in manual mode at its last duty: %s", header_id, exc)
+                            self.restore_failures.append(header_id)
         self.expected = {}
         if not self.restore_failures:
             self.originals = {}

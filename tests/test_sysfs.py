@@ -295,3 +295,27 @@ def test_restore_from_state_file_leaves_full_speed(tree, tmp_path):
     assert restore_from_state_file(tmp_path / "state.json") == []
     assert text(tree / "pwm1") == "255"
     assert text(tree / "pwm1_enable") == "1"
+
+
+def test_manual_original_without_full_speed_write_is_a_restore_failure(tree, tmp_path):
+    """A manual original keeps the last duty, so a failed full speed write must not
+    count as a successful restore or remove the state file."""
+    put(tree / "pwm1_enable", "1\n")
+    b = make(tree, tmp_path)
+    b.start()
+    b.write_duty("p1", 10)
+    break_file(tree / "pwm1")
+    b.restore()
+    assert text(tree / "pwm1_enable") == "1"
+    assert b.restore_failures == ["p1"]
+    assert (tmp_path / "state.json").exists()
+
+
+def test_firmware_original_without_full_speed_write_hands_back_to_firmware(tree, tmp_path):
+    b = make(tree, tmp_path)
+    b.start()
+    b.write_duty("p1", 10)
+    break_file(tree / "pwm1")
+    b.restore()
+    assert text(tree / "pwm1_enable") == "5"
+    assert b.restore_failures == []
