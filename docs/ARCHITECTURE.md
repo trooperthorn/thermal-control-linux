@@ -60,3 +60,24 @@ A root-owned TOML file defines zones, curves, header assignments, floors and lim
 validated on load and on reload; an invalid file triggers fail-safe and keeps the last
 valid config out of use. Every change of config, mode or header enablement is logged to
 the journal with old and new values.
+
+### Config schema
+
+`thermalctl/config.py` loads the file with `tomllib` and raises `ConfigError` for any
+problem, which the controller treats as a fail-safe cause. The top level holds `mode`
+(`dry_run` or `active`, default `dry_run`), `[[zones]]` and `[[headers]]`.
+
+- A zone has `id`, `temperature_input`, `temperature_curve`, `hard_max_temp_c`,
+  `stale_after_s`, and optionally `load_input` with `load_curve`, which must be given
+  together.
+- A header has `id`, `path`, `mapped` (default false), `min_duty`, `min_rpm`,
+  `stall_window_s` and `zones`, a list of zone ids that must exist.
+- Curves are lists of `[input, duty]` pairs with at least two points and strictly
+  increasing input. Temperature inputs must lie in -50 to 150 C, load inputs in 0 to 100
+  percent, and every duty in 0 to 100.
+- Ids are unique within zones and within headers.
+
+`thermalctl/curves.py` interpolates linearly between points and clamps at both ends.
+The zone duty is the larger of the temperature and load curve values. `docs/example.toml`
+is a documented MediaIn-SVR example whose paths are unverified placeholders.
+

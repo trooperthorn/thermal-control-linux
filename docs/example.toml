@@ -1,0 +1,42 @@
+# Example configuration for MediaIn-SVR.
+#
+# UNVERIFIED: every path below is a placeholder. None of the hwmon numbers, pwm
+# numbers, header-to-fan mappings or input names has been measured on the host. See
+# UNVERIFIED.md for the commands that confirm them. Until a header has passed the
+# supervised mapping test, keep mapped = false and the service will not control it.
+
+# dry_run computes and logs only. Change to "active" only after mapping is proven.
+mode = "dry_run"
+
+[[zones]]
+id = "cpu"
+# UNVERIFIED placeholder path.
+temperature_input = "/sys/class/hwmon/hwmon0/temp1_input"
+# UNVERIFIED placeholder name; the load reader arrives with the controller slice.
+load_input = "cpu_load_percent"
+# Points are [temperature in C, duty percent]. Quiet when cool, full at 80 C.
+temperature_curve = [[40, 20], [55, 35], [70, 70], [80, 100]]
+# Points are [load percent, duty percent]. Load can raise the duty, never lower it.
+load_curve = [[0, 0], [50, 30], [90, 100]]
+hard_max_temp_c = 90
+stale_after_s = 10
+
+[[headers]]
+id = "pwm1"
+# UNVERIFIED placeholder path.
+path = "/sys/class/hwmon/hwmon1/pwm1"
+mapped = false
+min_duty = 20
+min_rpm = 300
+stall_window_s = 15
+zones = ["cpu"]
+
+[[headers]]
+id = "pwm2"
+# UNVERIFIED placeholder path.
+path = "/sys/class/hwmon/hwmon1/pwm2"
+mapped = false
+min_duty = 20
+min_rpm = 300
+stall_window_s = 15
+zones = ["cpu"]
