@@ -9,13 +9,14 @@ killed. If restoring the original fails, the header is set to full speed instead
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import math
 import os
 import signal
 import time
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from pathlib import Path
 
 from ..safety import Reading
@@ -30,9 +31,13 @@ class BackendError(Exception):
     """Raised when the backend cannot start safely."""
 
 
+class StateFileError(Exception):
+    """Raised when a state file exists but cannot be used to restore fans."""
+
+
 def duty_to_pwm(duty: float) -> int:
-    """Scale a duty percent to 0 to 255, clamping. A non-number means full speed."""
-    if not isinstance(duty, (int, float)) or math.isnan(duty):
+    """Scale a duty percent to 0 to 255, clamping. A non-finite or non-number duty means full speed."""
+    if not isinstance(duty, (int, float)) or not math.isfinite(duty):
         return FULL_PWM
     return max(0, min(FULL_PWM, round(duty / 100.0 * FULL_PWM)))
 
@@ -94,9 +99,22 @@ class SysfsBackend:
         """Record originals, persist them, then set manual mode on mapped headers."""
         if self.started:
             return
-        self.started = True
         if not self.active:
+            self.started = True
             return
+        # A state file left by a killed run holds the true firmware originals. Put
+        # those back first, so the values read below are not our own manual mode.
+        if self.state_file.exists():
+            try:
+                fallbacks = restore_from_state_file(self.state_file)
+            except StateFileError as exc:
+                raise BackendError(f"stale state file blocks start: {exc}") from exc
+            if fallbacks:
+                raise BackendError(
+                    "stale state file could not be fully restored for "
+                    + ", ".join(sorted(fallbacks))
+                )
+        self.started = True
         try:
             for header_id in sorted(self.mapped):
                 value = int(_read_text(_enable_path(self.headers[header_id])))
@@ -111,6 +129,11 @@ class SysfsBackend:
     def restore(self) -> None:
         """Restore every recorded pwmN_enable, or write full speed when that fails."""
         self.restore_failures = []
+        with _signals_deferred():
+            self._restore_all()
+        self.started = False
+
+    def _restore_all(self) -> None:
         for header_id, original in self.originals.items():
             pwm = self.headers[header_id]
             try:
@@ -130,7 +153,6 @@ class SysfsBackend:
                 pass
             except OSError as exc:
                 log.error("cannot remove state file: %s", exc)
-        self.started = False
 
     def __enter__(self) -> "SysfsBackend":
         self.start()
@@ -149,6 +171,8 @@ class SysfsBackend:
         with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
             json.dump(data, handle, sort_keys=True)
             handle.write("\n")
+        if os.name == "posix":
+            os.chmod(tmp, 0o600)
         os.replace(tmp, self.state_file)
 
     # Backend interface -----------------------------------------------------------
@@ -185,8 +209,28 @@ class SysfsBackend:
         pwm = self.headers[header_id]
         try:
             _write_int(_enable_path(pwm), self.originals[header_id])
-        except OSError:
-            _write_int(pwm, FULL_PWM)
+        except OSError as exc:
+            log.error("release of %s failed (%s); writing full speed", header_id, exc)
+            try:
+                _write_int(pwm, FULL_PWM)
+            except OSError as exc2:
+                log.error("full speed write to %s failed: %s", header_id, exc2)
+
+
+@contextlib.contextmanager
+def _signals_deferred() -> Iterator[None]:
+    """Ignore SIGTERM and SIGINT while restoring, so a second signal cannot cut it short."""
+    saved: list[tuple[int, object]] = []
+    try:
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            saved.append((sig, signal.signal(sig, signal.SIG_IGN)))
+    except ValueError:
+        pass  # Not the main thread: handlers cannot be changed, and none were installed here.
+    try:
+        yield
+    finally:
+        for sig, old in saved:
+            signal.signal(sig, old)  # type: ignore[arg-type]
 
 
 def install_signal_handlers() -> None:
@@ -199,15 +243,41 @@ def install_signal_handlers() -> None:
     signal.signal(signal.SIGINT, handler)
 
 
+def _valid_pwm_path(path: object) -> bool:
+    """A state file may only name files called pwmN, so it cannot redirect writes."""
+    if not isinstance(path, str) or not path:
+        return False
+    name = path.replace("\\", "/").rsplit("/", 1)[-1]
+    return name.startswith("pwm") and name[3:].isdigit()
+
+
 def restore_from_state_file(state_file: str | Path) -> list[str]:
-    """Restore originals saved by a killed service. Returns header ids that fell back."""
+    """Restore originals saved by a killed service. Returns header ids that fell back.
+
+    The state file is trusted to be root-only, since it names files that get written. On
+    POSIX a file writable by group or others is refused, and every listed path must be a
+    pwmN file. A missing file means nothing to restore and returns an empty list. An
+    unreadable, malformed or untrusted file raises StateFileError, so the caller knows
+    fans may still be in manual mode.
+    """
     path = Path(state_file)
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        headers = data["headers"]
-        originals = {h: int(v) for h, v in data["originals"].items()}
-    except (OSError, ValueError, KeyError, AttributeError):
+    if not path.exists():
         return []
+    try:
+        if os.name == "posix" and path.stat().st_mode & 0o022:
+            raise StateFileError(f"{path} is writable by group or others")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        headers = {str(h): p for h, p in data["headers"].items()}
+        originals = {str(h): int(v) for h, v in data["originals"].items()}
+    except StateFileError:
+        log.error("state file %s is not trusted", path)
+        raise
+    except (OSError, ValueError, KeyError, AttributeError, TypeError) as exc:
+        log.error("cannot read state file %s: %s", path, exc)
+        raise StateFileError(f"cannot read {path}: {exc}") from exc
+    if not all(_valid_pwm_path(p) for p in headers.values()) or set(originals) - set(headers):
+        log.error("state file %s names paths that are not pwm files", path)
+        raise StateFileError(f"{path} names paths that are not pwm files")
     backend = SysfsBackend(headers, {}, headers.keys(), path, active=True)
     backend.originals = originals
     backend.restore()

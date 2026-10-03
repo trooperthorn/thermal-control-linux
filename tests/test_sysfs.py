@@ -1,10 +1,13 @@
 import json
+import signal
 
 import pytest
 
 from thermalctl.backends.sysfs import (
     BackendError,
+    StateFileError,
     SysfsBackend,
+    install_signal_handlers,
     duty_to_pwm,
     restore_from_state_file,
 )
@@ -49,7 +52,7 @@ def break_file(path):
 
 @pytest.mark.parametrize(
     "duty,pwm",
-    [(0, 0), (100, 255), (50, 128), (-10, 0), (250, 255), (float("nan"), 255)],
+    [(0, 0), (100, 255), (50, 128), (-10, 0), (250, 255), (float("nan"), 255), (float("inf"), 255), (float("-inf"), 255)],
 )
 def test_scaling_and_clamping(duty, pwm):
     assert duty_to_pwm(duty) == pwm
@@ -143,3 +146,104 @@ def test_state_file_helper_after_kill(tree, tmp_path):
     assert text(tree / "pwm2_enable") == "2"
     assert not (tmp_path / "state.json").exists()
     assert restore_from_state_file(tmp_path / "missing.json") == []
+
+
+def test_stale_state_file_restored_before_recording(tree, tmp_path):
+    b = make(tree, tmp_path)
+    b.start()  # simulate a killed run: manual mode set, state file left behind
+    assert text(tree / "pwm1_enable") == "1"
+    b2 = make(tree, tmp_path)
+    b2.start()
+    assert b2.originals == {"p1": 5, "p2": 2}
+    b2.restore()
+    assert text(tree / "pwm1_enable") == "5"
+    assert text(tree / "pwm2_enable") == "2"
+    assert not (tmp_path / "state.json").exists()
+
+
+def test_unreadable_state_file_blocks_start(tree, tmp_path):
+    (tmp_path / "state.json").write_text("{not json", encoding="utf-8")
+    b = make(tree, tmp_path)
+    with pytest.raises(BackendError):
+        b.start()
+    assert text(tree / "pwm1_enable") == "5"
+    assert (tmp_path / "state.json").read_text(encoding="utf-8") == "{not json"
+
+
+def test_stale_restore_failure_blocks_start(tree, tmp_path):
+    make(tree, tmp_path).start()
+    break_file(tree / "pwm1_enable")
+    with pytest.raises(BackendError):
+        make(tree, tmp_path).start()
+    assert (tmp_path / "state.json").exists()
+
+
+def test_restore_from_state_file_errors(tmp_path):
+    assert restore_from_state_file(tmp_path / "none.json") == []
+    bad = tmp_path / "bad.json"
+    bad.write_text("[]", encoding="utf-8")
+    with pytest.raises(StateFileError):
+        restore_from_state_file(bad)
+
+
+def test_state_file_with_non_pwm_path_is_refused(tmp_path):
+    target = tmp_path / "victim"
+    target.write_text("x", encoding="utf-8")
+    bad = tmp_path / "evil.json"
+    bad.write_text(
+        json.dumps({"headers": {"p1": str(target)}, "originals": {"p1": 5}}),
+        encoding="utf-8",
+    )
+    with pytest.raises(StateFileError):
+        restore_from_state_file(bad)
+    assert target.read_text(encoding="utf-8") == "x"
+
+
+def test_release_full_speed_failure_is_logged(tree, tmp_path):
+    b = make(tree, tmp_path)
+    b.start()
+    break_file(tree / "pwm1_enable")
+    break_file(tree / "pwm1")
+    b.release("p1")  # must not raise
+    b.restore()
+
+
+@pytest.fixture
+def keep_handlers():
+    old = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGINT)}
+    yield
+    for s, h in old.items():
+        signal.signal(s, h)
+
+
+def test_signal_triggers_restore(tree, tmp_path, keep_handlers):
+    install_signal_handlers()
+    b = make(tree, tmp_path)
+    with pytest.raises(SystemExit):
+        with b:
+            assert text(tree / "pwm1_enable") == "1"
+            signal.raise_signal(signal.SIGINT)
+    assert text(tree / "pwm1_enable") == "5"
+    assert text(tree / "pwm2_enable") == "2"
+
+
+def test_signal_during_restore_does_not_stop_it(tree, tmp_path, keep_handlers, monkeypatch):
+    import thermalctl.backends.sysfs as mod
+
+    install_signal_handlers()
+    b = make(tree, tmp_path)
+    b.start()
+    real = mod._write_int
+    fired = []
+
+    def noisy(path, value):
+        if not fired:
+            fired.append(1)
+            signal.raise_signal(signal.SIGINT)
+        real(path, value)
+
+    monkeypatch.setattr(mod, "_write_int", noisy)
+    b.restore()
+    assert text(tree / "pwm1_enable") == "5"
+    assert text(tree / "pwm2_enable") == "2"
+    assert signal.getsignal(signal.SIGINT) is not signal.SIG_IGN
