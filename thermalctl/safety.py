@@ -97,6 +97,15 @@ class HeaderSafety:
         """Latch failsafe; the controller is shutting down."""
         self._exiting = True
 
+    def force_failsafe(self, now: float, reason: str) -> None:
+        """Enter failsafe at once for a cause found outside the normal checks."""
+        if self.state != FAILSAFE:
+            self.state = FAILSAFE
+            self.last_change = now
+        self.reasons = (reason,)
+        self._clear_since = None
+        self._stall_since = None
+
     def _stall_causes(
         self, now: float, commanded: float | None, rpm: float | None
     ) -> list[str]:

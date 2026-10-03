@@ -103,3 +103,33 @@ minimum and passes an explicit 0 only in failsafe-to-firmware mode. The hold per
 hysteresis, ramp rate and EMA alpha are constructor arguments here; wiring them to the
 config belongs to the controller slice.
 
+
+### Controller loop implementation
+
+`thermalctl/backend.py` defines the `Backend` interface (`read_inputs`, `read_rpm`,
+`write_duty`, `release`) and an in-memory `FakeBackend` for tests. The controller reaches
+hardware only through it.
+
+`thermalctl/controller.py` runs one cycle at a time. It reads inputs and RPMs, runs each
+header's state machine, smooths each zone input with an EMA, takes the largest zone duty
+for the header, applies the output shaper and the minimum duty, and writes the result only
+when the config mode is `active` and the header is mapped. In dry run it never calls a
+backend write. Any exception in a cycle forces failsafe on every header with a
+`cycle_error:<type>` reason, writes full speed (or releases to firmware) to enabled
+headers, resets smoothing so the duty recovers by ramping down from 100, and the loop
+continues. The next clean cycle starts the hold period, after which headers recover.
+
+The status file is written every cycle to a temp file in the same directory and renamed
+over the target, so a reader sees the old or the new document and never a partial one. The
+path is a constructor argument defaulting to `/run/thermalctl/status.json`; a failed write
+is logged and the previous file is left in place. It holds version, timestamp, mode,
+`config_valid`, per-zone inputs and curves, and per-header state, duty, RPM, reasons and
+last change.
+
+`Controller.reload(path)` validates a new config. An invalid file sets `config_valid` to
+false, which puts every header in failsafe with `invalid_config`, keeps the old config
+from driving anything, and is logged. Every accepted change of mode, header mapping,
+paths, floors, zones or curves is logged to `thermalctl.audit` with old and new values, as
+is every header state change. `shutdown()` latches failsafe and writes the final status.
+The hold period, EMA alpha, hysteresis, ramp rate and firmware-mode flag are constructor
+arguments; config keys for them and the CLI wiring are still to do.

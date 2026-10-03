@@ -1,0 +1,166 @@
+import json
+import logging
+
+from thermalctl.backend import FakeBackend
+from thermalctl.config import parse_config
+from thermalctl.controller import Controller
+from thermalctl.safety import Reading
+
+ZONE = {
+    "id": "cpu",
+    "temperature_input": "temp",
+    "temperature_curve": [[40, 20], [80, 100]],
+    "hard_max_temp_c": 90,
+    "stale_after_s": 10,
+    "load_input": "load",
+    "load_curve": [[0, 0], [100, 100]],
+}
+
+
+def header(hid, mapped):
+    return {
+        "id": hid, "path": "/fake/" + hid, "mapped": mapped, "min_duty": 20,
+        "min_rpm": 300, "stall_window_s": 15, "zones": ["cpu"],
+    }
+
+
+def make_config(mode="active"):
+    return parse_config(
+        {"mode": mode, "zones": [ZONE], "headers": [header("pwm1", True), header("pwm2", False)]}
+    )
+
+
+class Rig:
+    def __init__(self, tmp_path, mode="active"):
+        self.now = 1000.0
+        self.backend = FakeBackend()
+        self.status = tmp_path / "status.json"
+        self.ctl = Controller(
+            make_config(mode), self.backend, status_path=self.status,
+            clock=lambda: self.now, hold_s=5.0, ema_alpha=1.0,
+        )
+        self.set_inputs(50.0, 10.0)
+        self.backend.rpms = {"pwm1": 900.0, "pwm2": 900.0}
+
+    def set_inputs(self, temp, load):
+        self.backend.inputs = {
+            "temp": Reading(temp, self.now), "load": Reading(load, self.now),
+        }
+
+    def cycle(self, advance=1.0):
+        self.now += advance
+        self.set_inputs(self.backend.inputs["temp"].value, self.backend.inputs["load"].value)
+        return self.ctl.cycle()
+
+    def doc(self):
+        return json.loads(self.status.read_text(encoding="utf-8"))
+
+
+def test_dry_run_never_writes(tmp_path):
+    rig = Rig(tmp_path, "dry_run")
+    for _ in range(3):
+        rig.cycle()
+    rig.backend.fail_reads = True
+    rig.cycle()
+    rig.ctl.shutdown()
+    assert rig.backend.writes == [] and rig.backend.releases == []
+    assert rig.doc()["mode"] == "dry_run"
+
+
+def test_active_writes_only_mapped_headers(tmp_path):
+    rig = Rig(tmp_path)
+    doc = rig.cycle()
+    assert [w[0] for w in rig.backend.writes] == ["pwm1"]
+    assert doc["headers"]["pwm1"]["state"] == "active"
+    assert doc["headers"]["pwm2"]["state"] == "dry_run"
+    assert doc["headers"]["pwm2"]["duty"] is not None
+
+
+def test_quiet_when_cool_and_full_when_hot(tmp_path):
+    rig = Rig(tmp_path)
+    rig.set_inputs(30.0, 0.0)
+    assert rig.cycle()["headers"]["pwm1"]["duty"] == 20.0
+    rig.set_inputs(85.0, 95.0)
+    assert rig.cycle()["headers"]["pwm1"]["duty"] == 100.0
+
+
+def test_read_exception_fails_safe_then_recovers(tmp_path):
+    rig = Rig(tmp_path)
+    rig.cycle()
+    rig.backend.writes.clear()
+    rig.backend.fail_reads = True
+    doc = rig.cycle()
+    for hid in ("pwm1", "pwm2"):
+        assert doc["headers"][hid]["state"] == "failsafe"
+        assert any(r.startswith("cycle_error") for r in doc["headers"][hid]["reasons"])
+    assert rig.backend.writes == [("pwm1", 100.0)]
+    rig.backend.fail_reads = False
+    assert rig.cycle()["headers"]["pwm1"]["state"] == "failsafe"
+    doc = rig.cycle(advance=6.0)
+    doc = rig.cycle(advance=6.0)
+    assert doc["headers"]["pwm1"]["state"] == "active"
+    assert doc["headers"]["pwm2"]["state"] == "dry_run"
+
+
+def test_status_file_valid_after_every_cycle_and_no_temp(tmp_path):
+    rig = Rig(tmp_path)
+    for i in range(5):
+        rig.backend.fail_reads = i == 2
+        rig.cycle()
+        doc = rig.doc()
+        assert {"version", "timestamp", "mode", "headers", "zones"} <= doc.keys()
+        assert set(doc["headers"]["pwm1"]) >= {"state", "duty", "rpm", "reasons"}
+        assert [p.name for p in tmp_path.iterdir()] == ["status.json"]
+
+
+def test_failed_status_write_keeps_previous_file(tmp_path, monkeypatch, caplog):
+    rig = Rig(tmp_path)
+    rig.cycle()
+    before = rig.status.read_text(encoding="utf-8")
+
+    def broken(src, dst):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("thermalctl.controller.os.replace", broken)
+    rig.cycle()
+    assert rig.status.read_text(encoding="utf-8") == before
+    assert "status file write failed" in caplog.text
+
+
+def test_invalid_reload_keeps_failsafe_and_logs(tmp_path, caplog):
+    rig = Rig(tmp_path)
+    rig.cycle()
+    bad = tmp_path / "bad.toml"
+    bad.write_text("mode = 'sideways'\n", encoding="utf-8", newline="\n")
+    with caplog.at_level(logging.INFO, logger="thermalctl.audit"):
+        assert rig.ctl.reload(bad) is False
+    assert "config reload rejected" in caplog.text
+    doc = rig.cycle()
+    assert doc["config_valid"] is False
+    assert doc["headers"]["pwm1"]["state"] == "failsafe"
+    assert "invalid_config" in doc["headers"]["pwm1"]["reasons"]
+    assert rig.backend.writes[-1] == ("pwm1", 100.0)
+
+
+def test_valid_reload_audits_old_and_new(tmp_path, caplog):
+    rig = Rig(tmp_path)
+    good = tmp_path / "good.toml"
+    good.write_text(
+        'mode = "dry_run"\n[[zones]]\nid = "cpu"\ntemperature_input = "temp"\n'
+        "temperature_curve = [[40, 20], [80, 100]]\nhard_max_temp_c = 90\nstale_after_s = 10\n"
+        '[[headers]]\nid = "pwm1"\npath = "/fake/pwm1"\nmapped = true\nmin_duty = 20\n'
+        'min_rpm = 300\nstall_window_s = 15\nzones = ["cpu"]\n',
+        encoding="utf-8", newline="\n",
+    )
+    with caplog.at_level(logging.INFO, logger="thermalctl.audit"):
+        assert rig.ctl.reload(good) is True
+    assert "mode=active->dry_run" in caplog.text
+    assert "header pwm2 present=True->False" in caplog.text
+
+
+def test_shutdown_goes_full_speed_on_mapped_headers(tmp_path):
+    rig = Rig(tmp_path)
+    rig.cycle()
+    rig.ctl.shutdown()
+    assert rig.backend.writes[-1] == ("pwm1", 100.0)
+    assert rig.doc()["headers"]["pwm1"]["state"] == "failsafe"
