@@ -1,5 +1,6 @@
 import json
 import re
+import signal
 import socket
 import time
 from pathlib import Path
@@ -183,6 +184,24 @@ def test_active_run_restores_originals_on_exit(tmp_path):
     assert (tree / "pwm2_enable").read_text() == "2\n"
     assert not state.exists()
     assert (tree / "pwm1").read_text() != "128\n"  # a duty was written while active
+
+
+def test_sigterm_stop_exits_zero_after_restore(tmp_path):
+    # systemd reported "Failed with result 'exit-code'" for a plain stop (status 143).
+    tree = make_tree(tmp_path)
+    config = write_config(tmp_path, tree, mode="active")
+    proc = write_proc_stat(tmp_path, 100, 900)
+
+    def stop_by_signal():
+        raise SystemExit(128 + signal.SIGTERM)
+
+    code = cli.run_service(
+        str(config), str(tmp_path / "status.json"), str(tmp_path / "state.json"), 1.0,
+        should_stop=stop_by_signal, sleep=lambda s: None, notifier=Notifier(environ={}),
+        proc_stat=str(proc),
+    )
+    assert code == 0
+    assert (tree / "pwm1_enable").read_text() == "5\n"
 
 
 def test_run_with_invalid_config_touches_nothing(tmp_path):

@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import signal
 import sys
 import time
 from collections.abc import Callable
@@ -195,6 +196,10 @@ def _serve(
         _err(f"cannot start: {exc}")
         return 1
     except SystemExit as exc:
+        # SIGTERM and SIGINT are a normal stop once the fans are restored, so systemd
+        # must not record the unit as failed.
+        if exc.code in (128 + signal.SIGTERM, 128 + signal.SIGINT):
+            return 0
         return exc.code if isinstance(exc.code, int) else 1
     return 0
 
