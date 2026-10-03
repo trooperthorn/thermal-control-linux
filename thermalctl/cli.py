@@ -212,6 +212,14 @@ def cmd_status(args: argparse.Namespace) -> int:
         _out(text.rstrip("\n"))
     else:
         _out(f"mode {doc.get('mode')}, config valid {doc.get('config_valid')}, age {age:.0f} s")
+        # The inputs each zone is reacting to, so the duties below can be judged against them.
+        # A missing value prints as "unavailable", never as zero.
+        for zid, zone in sorted(doc.get("zones", {}).items()):
+            temp, load = zone.get("temperature"), zone.get("load")
+            temp_text = "unavailable" if temp is None else f"{temp:.1f} C"
+            load_text = "not used" if "load" not in zone or (load is None and zone.get("load_curve") is None) \
+                else ("unavailable" if load is None else f"{load:.0f} %")
+            _out(f"  zone {zid}: temperature {temp_text}, load {load_text}")
         for hid, header in sorted(doc.get("headers", {}).items()):
             reasons = ",".join(header.get("reasons", [])) or "none"
             _out(

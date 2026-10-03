@@ -10,7 +10,7 @@ measured are listed in `UNVERIFIED.md`.
 
 - `thermalctl run --config PATH` runs the control loop. It is a dry run unless the config
   says `mode = "active"`, and even then it writes only to headers marked `mapped = true`.
-- `thermalctl status` prints the status file the service writes. `--json` prints it raw.
+- `thermalctl status` prints the status file the service writes: each zone's temperature and CPU load, then each header's state, duty, RPM and reasons. `--json` prints it raw.
   It exits non-zero when the file is missing or older than `--max-age` seconds.
 - `thermalctl check-config PATH` validates a config file and changes nothing. It rejects curves whose duty falls as the input rises and temperature curves that do not reach 100 percent at or below `hard_max_temp_c`.
 - `thermalctl restore` refuses while the running service holds the ownership lock; `--force`

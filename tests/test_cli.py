@@ -646,3 +646,16 @@ def test_retake_rewrites_manual_mode_after_a_foreign_change(tmp_path):
         sysfs.retake("pwm1")
         assert (tree / "pwm1_enable").read_text().strip() == "1"
         assert sysfs.owns("pwm1")
+
+
+def test_status_prints_zone_temperature_and_load(tmp_path, capsys):
+    status = tmp_path / "status.json"
+    doc = {"timestamp": time.time(), "mode": "dry_run", "config_valid": True,
+           "zones": {"cpu": {"temperature": 34.04, "load": 2.6, "load_curve": [[0, 0], [90, 100]]},
+                     "disks": {"temperature": None, "load": None, "load_curve": None}},
+           "headers": {"pwm1": {"state": "dry_run", "duty": 20, "rpm": 970, "reasons": []}}}
+    put(status, json.dumps(doc))
+    assert main(["status", "--status-path", str(status)]) == 0
+    out = capsys.readouterr().out
+    assert "zone cpu: temperature 34.0 C, load 3 %" in out
+    assert "zone disks: temperature unavailable, load not used" in out
