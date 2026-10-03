@@ -678,3 +678,88 @@ def test_status_prints_zone_temperature_and_load(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "zone cpu: temperature 34.0 C, load 3 %" in out
     assert "zone disks: temperature unavailable, load not used" in out
+
+
+# -- stall search ---------------------------------------------------------------------
+
+
+def _fan_sim(tree, n=1, stop_below=25, start_at=40):
+    """Make fanN follow pwmN like a real fan: stops below one duty, restarts only at a higher one."""
+    state = {"spinning": True}
+
+    def settle():
+        duty = int((tree / f"pwm{n}").read_text()) / 255 * 100
+        if state["spinning"] and duty < stop_below - 0.5:
+            state["spinning"] = False
+        elif not state["spinning"] and duty >= start_at - 0.5:
+            state["spinning"] = True
+        put(tree / f"fan{n}_input", f"{int(duty * 15) if state['spinning'] else 0}\n")
+
+    return settle
+
+
+def _stall_args(config, state):
+    return cli.build_parser().parse_args(
+        ["map-headers", "--config", str(config), "--state-file", str(state), "--apply", "--find-stall"]
+    )
+
+
+def test_find_stall_recommends_above_restart_point_and_restores(tmp_path, capsys):
+    tree = make_tree(tmp_path)
+    config = write_config(tmp_path, tree)
+    state = tmp_path / "state.json"
+    answers = iter(["", "s"])
+    code = cli.cmd_map_headers(_stall_args(config, state), is_tty=lambda: True,
+                               ask=lambda p: next(answers), settle=_fan_sim(tree))
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "pwm1: stops at 20 percent, restarts at 40; recommended min_duty = 50 (now 20)" in out
+    assert "pwm2: skipped" in out
+    # Left at full speed before release, then handed back to firmware.
+    assert (tree / "pwm1").read_text() == "255\n"
+    assert (tree / "pwm1_enable").read_text() == "5\n"
+    assert (tree / "pwm2_enable").read_text() == "2\n"
+    assert not state.exists()
+
+
+def test_find_stall_fan_that_never_stops(tmp_path, capsys):
+    tree = make_tree(tmp_path)
+    config = write_config(tmp_path, tree)
+    answers = iter(["", "s"])
+    code = cli.cmd_map_headers(_stall_args(config, tmp_path / "state.json"), is_tty=lambda: True,
+                               ask=lambda p: next(answers), settle=_fan_sim(tree, stop_below=0))
+    assert code == 0
+    assert "pwm1: kept spinning down to 10 percent" in capsys.readouterr().out
+
+
+def test_find_stall_refuses_without_mapped_headers(tmp_path, capsys):
+    tree = make_tree(tmp_path)
+    config = write_config(tmp_path, tree, mapped="false")
+    code = cli.cmd_map_headers(_stall_args(config, tmp_path / "state.json"), is_tty=lambda: True,
+                               ask=lambda p: "", settle=lambda: None)
+    assert code == 1
+    assert "no mapped headers" in capsys.readouterr().err
+    assert (tree / "pwm1_enable").read_text() == "5\n"
+
+
+def test_find_stall_restores_when_interrupted(tmp_path):
+    tree = make_tree(tmp_path)
+    config = write_config(tmp_path, tree)
+    state = tmp_path / "state.json"
+
+    def interrupt():
+        raise KeyboardInterrupt
+
+    code = cli.cmd_map_headers(_stall_args(config, state), is_tty=lambda: True,
+                               ask=lambda p: "", settle=interrupt)
+    assert code == 1
+    assert (tree / "pwm1_enable").read_text() == "5\n"
+    assert not state.exists()
+
+
+def test_recommend_min_duty():
+    from thermalctl.mapping import recommend_min_duty
+    assert recommend_min_duty(None, None) is None
+    assert recommend_min_duty(20, 40) == 50
+    assert recommend_min_duty(30, 30) == 45
+    assert recommend_min_duty(20, None) == 100

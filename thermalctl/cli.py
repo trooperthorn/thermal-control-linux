@@ -28,7 +28,7 @@ from .controller import DEFAULT_STATUS_PATH, Controller
 from .hwmon import DEFAULT_HWMON_ROOT, HwmonError, resolve_config
 from .load import SUPPORTED_LOAD_INPUTS, LoadBackend
 from .lock import LockHeld, OwnerLock, default_lock_path, is_held
-from .mapping import plan_lines, run_mapping
+from .mapping import plan_lines, run_mapping, run_stall_search, stall_plan_lines
 from .notify import Notifier
 
 DEFAULT_STATE_FILE = "/run/thermalctl/state.json"
@@ -78,6 +78,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--apply",
         action="store_true",
         help="really lower each header (needs a terminal); without it only the plan is printed",
+    )
+    mapping.add_argument(
+        "--find-stall",
+        action="store_true",
+        help="on mapped headers, find the duty where each fan stops and restarts, and recommend min_duty",
     )
     return parser
 
@@ -293,7 +298,7 @@ def cmd_map_headers(
     except HwmonError as exc:
         _err(f"cannot find fan hardware: {exc}")
         return 1
-    for line in plan_lines(config):
+    for line in (stall_plan_lines() if args.find_stall else plan_lines(config)):
         _out(line)
     if not args.apply:
         _out("Dry run: nothing was written. Add --apply on a terminal to run the test.")
@@ -315,7 +320,13 @@ def cmd_map_headers(
         return 1
     install_signal_handlers()
     try:
-        run_mapping(config, args.state_file, ask=ask, say=_out, settle=settle)
+        if args.find_stall:
+            if not any(h.mapped for h in config.headers):
+                _err("no mapped headers; run the mapping test first")
+                return 1
+            run_stall_search(config, args.state_file, ask=ask, say=_out, settle=settle)
+        else:
+            run_mapping(config, args.state_file, ask=ask, say=_out, settle=settle)
     except (BackendError, StateFileError) as exc:
         _err(f"mapping stopped: {exc}")
         return 1

@@ -18,7 +18,8 @@ measured are listed in `UNVERIFIED.md`.
   systemd unit runs it as `ExecStopPost`, so it also runs after the service was killed.
   It writes full speed (pwm 255) to each header before restoring its mode, so a header
   whose original mode was manual (1) is left at full speed, not at its last low duty.
-- `thermalctl map-headers --config PATH` prints the plan for the header mapping test.
+- `thermalctl map-headers --config PATH` prints the plan for the header mapping test. With
+  `--apply --find-stall` it measures each mapped fan's stop and restart duty.
   With `--apply`, and only on a terminal, it lowers one header at a time, shows which fan
   input fell, and restores the original mode before moving on. It refuses while the
   service holds the ownership lock, so stop the service first.
@@ -50,7 +51,19 @@ with the temperatures for a while. Only then run the mapping test for each heade
     thermalctl map-headers --config /etc/thermalctl/config.toml --apply
 
 The first command only prints the plan. Set `mapped = true` on a header only after you
-have confirmed which fan it drives, and change `mode` to `"active"` last. A change of
+have confirmed which fan it drives, and change `mode` to `"active"` last.
+
+Many fans stop below some duty, and need more than that to start again from rest. Before
+going active, find each mapped header's floor with the service stopped:
+
+    systemctl stop thermalctl
+    thermalctl map-headers --config /etc/thermalctl/config.toml --apply --find-stall
+
+Each mapped header steps down from 100 percent in 5 percent steps until its fan stops,
+then steps up until it restarts, and the result is a recommended `min_duty`: the higher
+of the two points plus a 10 percent margin. The fan sits stopped for up to about half a
+minute per header, so run it at idle. Nothing is written to the config; copy the values
+in by hand. A change of
 mode, mapping, curve or floor is written to the journal with the old and new values.
 The service reads its config at start. A reload that switches from dry run to active, or
 maps a header or changes a mapped header's path, is refused and logged; restart the service
