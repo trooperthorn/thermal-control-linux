@@ -390,3 +390,30 @@ def test_reload_does_not_hide_programming_errors(tmp_path):
     rig.ctl.config_transform = boom
     with pytest.raises(ValueError):
         rig.ctl.reload(_write_reload(tmp_path, _reload_text("dry_run", "true")))
+
+
+class TickingBackend(FakeBackend):
+    """Stamps each reading with the shared clock as it is read, like the sysfs backend."""
+
+    def __init__(self, clock):
+        super().__init__()
+        self.clock = clock
+
+    def read_inputs(self):
+        return {"temp": Reading(45.0, self.clock()), "load": Reading(10.0, self.clock())}
+
+
+def test_readings_stamped_during_the_cycle_are_not_stale(tmp_path):
+    """Regression for MediaIn-SVR 2026-10-03: the cycle time was taken before the reads,
+    so with a real clock every fresh reading looked a little in the future and every
+    header went to fail-safe as stale."""
+    ticks = iter(range(1, 10_000))
+    clock = lambda: float(next(ticks))  # noqa: E731  every call is later than the last
+    backend = TickingBackend(clock)
+    backend.rpms = {"pwm1": 900.0, "pwm2": 900.0}
+    ctl = Controller(make_config("dry_run"), backend, status_path=tmp_path / "s.json",
+                     clock=clock, hold_s=5.0, ema_alpha=1.0)
+    for _ in range(3):
+        doc = ctl.cycle()
+    for hid in ("pwm1", "pwm2"):
+        assert doc["headers"][hid]["state"] == "dry_run", doc["headers"][hid]["reasons"]

@@ -306,6 +306,10 @@ class Controller:
         try:
             readings = dict(self.backend.read_inputs())
             rpms = {h.id: self.backend.read_rpm(h.id) for h in self.config.headers}
+            # Take the cycle time after the reads. Readings are stamped as they are taken,
+            # so a time taken before them makes every fresh reading look a little in the
+            # future, and the staleness check rightly treats a future timestamp as stale.
+            now = self.clock()
             dt = 0.0 if self.last_time is None else max(0.0, now - self.last_time)
             zones = {z.id: z for z in self.config.zones}
             for header in self.config.headers:
