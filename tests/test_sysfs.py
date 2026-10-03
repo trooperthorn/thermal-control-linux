@@ -319,3 +319,19 @@ def test_firmware_original_without_full_speed_write_hands_back_to_firmware(tree,
     b.restore()
     assert text(tree / "pwm1_enable") == "5"
     assert b.restore_failures == []
+
+
+def test_restore_skips_full_speed_write_for_header_already_in_firmware_mode(tree, tmp_path, caplog):
+    """After the mapping test releases a header to firmware mode 5, the chip rejects pwm
+    writes with EBUSY. Restore must not try, and must not log a false error."""
+    b = make(tree, tmp_path)
+    b.start()
+    b.write_duty("p1", 10)
+    b.release("p1")  # back to firmware mode 5, as the mapping test does
+    assert text(tree / "pwm1_enable") == "5"
+    break_file(tree / "pwm1")  # stands in for the chip refusing the write
+    with caplog.at_level("ERROR"):
+        b.restore()
+    assert b.restore_failures == []
+    assert "full speed write to p1 failed" not in caplog.text
+    assert text(tree / "pwm1_enable") == "5"

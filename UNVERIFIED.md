@@ -46,3 +46,11 @@ The meaning of the pwmN_enable values (5 and 0 here) is still unverified; see be
 | Another program that changes a `pwmN_enable` is detected within one cycle and the header goes to full speed | Supervised test: run active on one mapped header, `echo 2 > pwmN_enable` from a shell, and watch `thermalctl status` and `fanN_input` |
 | TrueNAS can run the unit (systemd) or needs a Post Init script instead | `systemctl --version` on TrueNAS-SVR |
 
+
+## Header mapping on MediaIn-SVR (measured 2026-10-03)
+
+The owner ran `thermalctl map-headers --apply`. Each header lowered to 30 percent slowed the fan
+with the same number: pwm1 to fan1 (down 823 RPM), pwm2 to fan2 (down 1071 RPM), pwm3 to fan3
+(down 923 RPM) and pwm4 to fan4 (down 1744 RPM). Smaller drops on other fans (4 to 156 RPM) are
+airflow inside the case. Writing pwmN while pwmN_enable is 5 returned EBUSY on this nct6779,
+which confirms that mode 5 is a chip-controlled mode that rejects manual duty writes.
