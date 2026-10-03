@@ -47,6 +47,12 @@ def test_good_config_parses():
     assert cfg.headers[0].zones == ("cpu",)
 
 
+def test_min_rpm_duty_defaults_and_parses():
+    assert parse_config(copy.deepcopy(GOOD)).headers[0].min_rpm_duty == 50.0
+    data = mutated(lambda d: d["headers"][0].update(min_rpm_duty=70))
+    assert parse_config(data).headers[0].min_rpm_duty == 70.0
+
+
 def test_example_validates():
     cfg = load_config(EXAMPLE)
     assert cfg.mode == "dry_run"
@@ -106,6 +112,7 @@ CASES = {
     "min duty below 0": header_update(min_duty=-5),
     "negative min rpm": header_update(min_rpm=-1),
     "fractional min rpm": header_update(min_rpm=1.5),
+    "min rpm duty above 100": header_update(min_rpm_duty=101),
     "stall window zero": header_update(stall_window_s=0),
     "mapped not bool": header_update(mapped="yes"),
     "missing header path": lambda d: d["headers"][0].pop("path"),

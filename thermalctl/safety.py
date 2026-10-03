@@ -24,6 +24,7 @@ INVALID_INPUT = "invalid_input"
 STALE_INPUT = "stale_input"
 OVER_TEMP = "over_temp"
 STALL = "stall"
+LOW_RPM = "low_rpm"
 INVALID_CONFIG = "invalid_config"
 EXITING = "exiting"
 
@@ -91,6 +92,7 @@ class HeaderSafety:
         self.last_change: float | None = None
         self._clear_since: float | None = None
         self._stall_since: float | None = None
+        self._low_rpm_since: float | None = None
         self._exiting = False
 
     def request_exit(self) -> None:
@@ -105,21 +107,39 @@ class HeaderSafety:
         self.reasons = (reason,)
         self._clear_since = None
         self._stall_since = None
+        self._low_rpm_since = None
 
     def _stall_causes(
         self, now: float, commanded: float | None, rpm: float | None
     ) -> list[str]:
         if not _number_ok(rpm) or rpm < 0:
             self._stall_since = None
+            self._low_rpm_since = None
             return [f"{INVALID_INPUT}:rpm:{self.header.id}"]
-        if commanded is not None and commanded > self.header.min_duty and rpm == 0:
+        causes: list[str] = []
+        # Any commanded duty above zero must turn the fan, including at the floor, where
+        # an idling fan is the common case and a dead one must be found early.
+        if commanded is not None and commanded > 0 and rpm == 0:
             if self._stall_since is None:
                 self._stall_since = now
             if now - self._stall_since > self.header.stall_window_s:
-                return [f"{STALL}:{self.header.id}"]
+                causes.append(f"{STALL}:{self.header.id}")
         else:
             self._stall_since = None
-        return []
+        # min_rpm 0 turns the RPM floor off, for fans that may legitimately stop.
+        if (
+            self.header.min_rpm > 0
+            and commanded is not None
+            and commanded >= self.header.min_rpm_duty
+            and rpm < self.header.min_rpm
+        ):
+            if self._low_rpm_since is None:
+                self._low_rpm_since = now
+            if now - self._low_rpm_since > self.header.stall_window_s:
+                causes.append(f"{LOW_RPM}:{self.header.id}")
+        else:
+            self._low_rpm_since = None
+        return causes
 
     def update(
         self,
@@ -158,6 +178,7 @@ class HeaderSafety:
                 self.last_change = now
                 self._clear_since = None
                 self._stall_since = None
+                self._low_rpm_since = None
 
 
 def failsafe_duty(firmware_mode: bool) -> float:

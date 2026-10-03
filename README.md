@@ -15,6 +15,8 @@ measured are listed in `UNVERIFIED.md`.
 - `thermalctl check-config PATH` validates a config file and changes nothing.
 - `thermalctl restore` reads the persisted original fan modes and puts them back. The
   systemd unit runs it as `ExecStopPost`, so it also runs after the service was killed.
+  It writes full speed (pwm 255) to each header before restoring its mode, so a header
+  whose original mode was manual (1) is left at full speed, not at its last low duty.
 - `thermalctl map-headers --config PATH` prints the plan for the header mapping test.
   With `--apply`, and only on a terminal, it lowers one header at a time, shows which fan
   input fell, and restores the original mode before moving on.
@@ -49,6 +51,13 @@ The first command only prints the plan. Set `mapped = true` on a header only aft
 have confirmed which fan it drives, and change `mode` to `"active"` last. A change of
 mode, mapping, curve or floor is written to the journal with the old and new values.
 The service reads its config at start; restart it to apply a change.
+
+## Stall and minimum RPM
+
+A fan commanded above 0 percent, including at its floor duty, that reads 0 RPM for longer
+than `stall_window_s` puts its header in fail-safe. A fan reading below `min_rpm` while
+commanded at or above `min_rpm_duty` (default 50 percent) for that window does too. Set
+`min_rpm = 0` for a fan that may legitimately stop, which turns the RPM floor off.
 
 ## hostwatch integration
 

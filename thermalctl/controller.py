@@ -66,7 +66,7 @@ def describe_changes(old: Config | None, new: Config) -> list[str]:
     out: list[str] = []
     if old.mode != new.mode:
         out.append(f"mode={old.mode}->{new.mode}")
-    header_fields = ("mapped", "path", "min_duty", "min_rpm", "stall_window_s", "zones")
+    header_fields = ("mapped", "path", "min_duty", "min_rpm", "stall_window_s", "zones", "min_rpm_duty")
     zone_fields = (
         "temperature_input", "temperature_curve", "hard_max_temp_c",
         "stale_after_s", "load_input", "load_curve",

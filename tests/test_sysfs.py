@@ -1,4 +1,5 @@
 import json
+import os
 import signal
 
 import pytest
@@ -102,6 +103,7 @@ def test_unmapped_and_dry_run_never_written(tree, tmp_path):
         b.release("p3")
         b.write_duty("nope", 100)
     assert text(tree / "pwm3") == "128" and text(tree / "pwm3_enable") == "5"
+    put(tree / "pwm1", "128\n")  # the active run above left mapped p1 at full speed
     with make(tree, tmp_path, active=False) as b:
         b.write_duty("p1", 100)
     assert text(tree / "pwm1") == "128" and text(tree / "pwm1_enable") == "5"
@@ -247,3 +249,49 @@ def test_signal_during_restore_does_not_stop_it(tree, tmp_path, keep_handlers, m
     assert text(tree / "pwm1_enable") == "5"
     assert text(tree / "pwm2_enable") == "2"
     assert signal.getsignal(signal.SIGINT) is not signal.SIG_IGN
+
+
+def record_writes(monkeypatch):
+    from thermalctl.backends import sysfs
+
+    real = sysfs._write_int
+    calls = []
+
+    def spy(path, value):
+        calls.append((os.path.basename(str(path)), value))
+        return real(path, value)
+
+    monkeypatch.setattr(sysfs, "_write_int", spy)
+    return calls
+
+
+def test_restore_manual_original_leaves_full_speed(tree, tmp_path):
+    put(tree / "pwm1_enable", "1\n")
+    b = make(tree, tmp_path)
+    b.start()
+    b.write_duty("p1", 10)
+    assert text(tree / "pwm1") != "255"
+    b.restore()
+    assert text(tree / "pwm1") == "255"
+    assert text(tree / "pwm1_enable") == "1"
+
+
+def test_restore_writes_full_speed_before_enable(tree, tmp_path, monkeypatch):
+    b = make(tree, tmp_path)
+    b.start()
+    b.write_duty("p1", 10)
+    calls = record_writes(monkeypatch)
+    b.restore()
+    assert calls.index(("pwm1", 255)) < calls.index(("pwm1_enable", 5))
+    assert text(tree / "pwm1_enable") == "5"
+    assert text(tree / "pwm1") == "255"
+
+
+def test_restore_from_state_file_leaves_full_speed(tree, tmp_path):
+    put(tree / "pwm1_enable", "1\n")
+    b = make(tree, tmp_path)
+    b.start()  # simulate SIGKILL: no restore runs
+    b.write_duty("p1", 10)
+    assert restore_from_state_file(tmp_path / "state.json") == []
+    assert text(tree / "pwm1") == "255"
+    assert text(tree / "pwm1_enable") == "1"

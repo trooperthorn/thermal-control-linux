@@ -24,7 +24,10 @@ says so. It is entered when any of these hold:
 
 - a zone input is missing, unreadable, not a number, or older than its staleness limit;
 - a temperature exceeds the zone's hard maximum;
-- a header commanded above its floor reports 0 RPM for longer than the stall window;
+- a header commanded above 0 percent, including at its floor, reports 0 RPM for longer
+  than the stall window;
+- a header with a non-zero `min_rpm` reports less than that for longer than the stall
+  window while commanded at or above its `min_rpm_duty`;
 - the config fails validation;
 - the controller is exiting for any reason.
 
@@ -71,7 +74,8 @@ problem, which the controller treats as a fail-safe cause. The top level holds `
   `stale_after_s`, and optionally `load_input` with `load_curve`, which must be given
   together.
 - A header has `id`, `path`, `mapped` (default false), `min_duty`, `min_rpm`,
-  `stall_window_s` and `zones`, a list of zone ids that must exist.
+  `stall_window_s`, `zones`, a list of zone ids that must exist, and optionally
+  `min_rpm_duty` (default 50), the commanded duty from which `min_rpm` is enforced.
 - Curves are lists of `[input, duty]` pairs with at least two points and strictly
   increasing input. Temperature inputs must lie in -50 to 150 C, load inputs in 0 to 100
   percent, and every duty in 0 to 100.
@@ -90,7 +94,10 @@ is mapped; otherwise it is `dry_run`. Any cause moves it to `failsafe` in the sa
 and the reasons are recorded as `kind:name` strings such as `stale_input:temp1`. Causes
 are: missing, non-numeric or non-finite input, a timestamp older than `stale_after_s` or
 in the future, a temperature above `hard_max_temp_c`, an unreadable RPM, 0 RPM while the
-commanded duty is above `min_duty` for longer than `stall_window_s`, invalid config, and
+commanded duty is above 0 (the floor included) for longer than `stall_window_s`, an RPM below
+a non-zero `min_rpm` while commanded at or above `min_rpm_duty` for longer than
+`stall_window_s` (reason `low_rpm:<id>`; `min_rpm = 0` turns this check off for fans that
+may stop), invalid config, and
 exit. Exit latches. For every other cause the header leaves failsafe only after all
 causes have been clear for the hold period, and a new cause restarts that period.
 `failsafe_duty` returns 100, or 0 meaning firmware control when that mode is configured.
@@ -153,8 +160,10 @@ On `start()` in active mode it reads `pwmN_enable` for every mapped header, save
 originals to the state file with an atomic rename, and only then writes manual mode. In
 dry run, or for an unmapped header, it never writes anything. `write_duty` scales the duty
 percent to 0 to 255, clamps it, and treats a non-number as full speed. `restore()` writes
-each recorded original back; if that write fails it writes 255 to the pwm file instead,
-and it keeps the state file when any header fell back. The backend is a context manager so
+255 to each pwm file first and then the recorded original `pwmN_enable`. A header whose
+original mode was manual (1) is therefore left at full speed, not at the last low duty;
+it stays at full speed until something sets it again. If the mode write fails the 255
+already written stands, and the state file is kept when any header fell back. The backend is a context manager so
 normal exit and exceptions restore, and `install_signal_handlers()` turns SIGTERM and
 SIGINT into `SystemExit` so they restore too. After a SIGKILL, `restore_from_state_file()`
 applies the saved originals, and is meant to be called by the `ExecStopPost` helper. The

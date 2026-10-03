@@ -127,7 +127,11 @@ class SysfsBackend:
             raise BackendError(f"cannot take control of fans: {exc}") from exc
 
     def restore(self) -> None:
-        """Restore every recorded pwmN_enable, or write full speed when that fails."""
+        """Write full speed, then restore every recorded pwmN_enable.
+
+        A header whose original mode was manual (1) is left at full speed, not at the
+        last low duty. A header whose mode write fails stays at full speed too.
+        """
         self.restore_failures = []
         with _signals_deferred():
             self._restore_all()
@@ -136,15 +140,22 @@ class SysfsBackend:
     def _restore_all(self) -> None:
         for header_id, original in self.originals.items():
             pwm = self.headers[header_id]
+            # Full speed goes in first. If the original mode is manual (1) the fan keeps
+            # this duty after the restore, so it must never be the last low value.
+            full_speed_written = True
+            try:
+                _write_int(pwm, FULL_PWM)
+            except OSError as exc:
+                full_speed_written = False
+                log.error("full speed write to %s failed: %s", header_id, exc)
             try:
                 _write_int(_enable_path(pwm), original)
             except OSError as exc:
-                log.error("restore of %s failed (%s); writing full speed", header_id, exc)
+                log.error("restore of %s failed (%s); fan left at full speed", header_id, exc)
                 self.restore_failures.append(header_id)
-                try:
-                    _write_int(pwm, FULL_PWM)
-                except OSError as exc2:
-                    log.error("full speed write to %s failed: %s", header_id, exc2)
+            else:
+                if not full_speed_written:
+                    log.error("%s restored to mode %s without a full speed write", header_id, original)
         if not self.restore_failures:
             self.originals = {}
             try:

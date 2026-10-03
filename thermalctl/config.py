@@ -42,6 +42,7 @@ class Header:
     min_rpm: int
     stall_window_s: float
     zones: tuple[str, ...]
+    min_rpm_duty: float = 50.0
 
 
 @dataclass(frozen=True)
@@ -154,6 +155,7 @@ def _header(table: object, index: int, zone_ids: set[str]) -> Header:
         min_rpm=int(min_rpm),
         stall_window_s=_positive(table, "stall_window_s", where),
         zones=tuple(zones),
+        min_rpm_duty=_duty(table.get("min_rpm_duty", 50), f"{where}: min_rpm_duty"),
     )
 
 

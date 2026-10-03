@@ -1,4 +1,5 @@
 import math
+from dataclasses import replace
 
 import pytest
 
@@ -78,14 +79,46 @@ def test_stall_after_window():
     assert "stall:pwm1" in m.reasons
 
 
-def test_no_stall_at_floor_or_with_rpm():
+def test_timer_restarts_when_rpm_returns():
+    m = machine()
+    step(m, 0, rpm=0.0)
+    step(m, 10, rpm=500.0)
+    assert step(m, 20, rpm=0.0) == ACTIVE  # timer restarted
+
+
+def test_no_stall_when_commanded_zero():
     m = machine()
     for t in range(0, 100, 5):
-        assert step(m, t, rpm=0.0, commanded=20.0) == ACTIVE
-    m2 = machine()
-    step(m2, 0, rpm=0.0)
-    step(m2, 10, rpm=500.0)
-    assert step(m2, 20, rpm=0.0) == ACTIVE  # timer restarted
+        assert step(m, t, rpm=0.0, commanded=0.0) == ACTIVE
+
+
+def test_dead_fan_at_floor_enters_failsafe_after_window():
+    m = machine()
+    assert step(m, 0, rpm=0.0, commanded=20.0) == ACTIVE
+    assert step(m, 15, rpm=0.0, commanded=20.0) == ACTIVE
+    assert step(m, 16, rpm=0.0, commanded=20.0) == FAILSAFE
+    assert "stall:pwm1" in m.reasons
+
+
+def test_fan_below_min_rpm_at_high_duty_enters_failsafe():
+    m = machine()
+    assert step(m, 0, rpm=100.0, commanded=80.0) == ACTIVE
+    assert step(m, 15, rpm=100.0, commanded=80.0) == ACTIVE
+    assert step(m, 16, rpm=100.0, commanded=80.0) == FAILSAFE
+    assert "low_rpm:pwm1" in m.reasons
+
+
+def test_low_rpm_below_duty_threshold_is_tolerated():
+    m = machine()
+    for t in range(0, 100, 5):
+        assert step(m, t, rpm=100.0, commanded=20.0) == ACTIVE
+
+
+def test_min_rpm_zero_disables_rpm_floor():
+    h = replace(HEADER, min_rpm=0)
+    m = HeaderSafety(h, 30.0, True)
+    for t in range(0, 100, 5):
+        assert step(m, t, rpm=1.0, commanded=100.0) == ACTIVE
 
 
 def test_unreadable_rpm_is_failsafe():

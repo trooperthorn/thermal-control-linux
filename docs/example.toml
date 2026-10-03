@@ -27,7 +27,10 @@ id = "pwm1"
 path = "/sys/class/hwmon/hwmon1/pwm1"
 mapped = false
 min_duty = 20
+# Set min_rpm to 0 for a fan that may legitimately stop; this turns the RPM floor off.
 min_rpm = 300
+# The RPM floor applies only while the commanded duty is at or above this percentage.
+min_rpm_duty = 50
 stall_window_s = 15
 zones = ["cpu"]
 
@@ -37,6 +40,9 @@ id = "pwm2"
 path = "/sys/class/hwmon/hwmon1/pwm2"
 mapped = false
 min_duty = 20
+# Set min_rpm to 0 for a fan that may legitimately stop; this turns the RPM floor off.
 min_rpm = 300
+# The RPM floor applies only while the commanded duty is at or above this percentage.
+min_rpm_duty = 50
 stall_window_s = 15
 zones = ["cpu"]
