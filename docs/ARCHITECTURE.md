@@ -138,7 +138,7 @@ from driving anything, and is logged. Every accepted change of mode, header mapp
 paths, floors, zones or curves is logged to `thermalctl.audit` with old and new values, as
 is every header state change. `shutdown()` latches failsafe and writes the final status.
 The hold period, EMA alpha, hysteresis, ramp rate and firmware-mode flag are constructor
-arguments; config keys for them and the CLI wiring are still to do.
+arguments; config keys for them are still to do; the CLI uses the defaults.
 
 ### sysfs backend implementation
 
@@ -158,4 +158,30 @@ and it keeps the state file when any header fell back. The backend is a context 
 normal exit and exceptions restore, and `install_signal_handlers()` turns SIGTERM and
 SIGINT into `SystemExit` so they restore too. After a SIGKILL, `restore_from_state_file()`
 applies the saved originals, and is meant to be called by the `ExecStopPost` helper. The
-wiring of the backend into the CLI and the systemd unit is still to do.
+CLI and the systemd unit use it as described below.
+
+### Command line, unit and restore helper
+
+`thermalctl/cli.py` has five commands, each returning an exit code. `run --config PATH`
+loads the config, builds the sysfs backend (temperature inputs are the file paths named
+by the zones, and only mapped headers are controlled in active mode), wraps it with the
+CPU load reader from `thermalctl/load.py`, and runs the controller. The load input is
+published as `cpu_load_percent`, computed from `/proc/stat`; any other `load_input` name
+is rejected by `check-config` and `run`. An invalid config at start leaves every fan
+untouched under firmware control and exits 1. `status` prints the status file and exits
+1 when it is missing or older than `--max-age`. `check-config PATH` validates only.
+`restore` calls `restore_from_state_file` on the persisted originals and exits 1 when the
+file is untrusted or any header fell back to full speed.
+
+`map-headers` prints the plan by default. With `--apply` it refuses unless stdin and
+stdout are terminals, then uses the backend (state file first) to lower one header at a
+time to 30 percent, wait, report which fan input beside the pwm file fell, and release
+the header, restoring everything on every exit path. It cannot rewrite the TOML config,
+so it prints the result and the owner sets `mapped = true` by hand.
+
+`thermalctl/notify.py` implements sd_notify over `NOTIFY_SOCKET` with the standard
+library. `run` sends `READY=1` after start, `WATCHDOG=1` once per cycle and `STOPPING=1`
+on the way out. `packaging/thermalctl.service` is `Type=notify` with `WatchdogSec=30`
+against a 2 second cycle, `Restart=always`, a `RuntimeDirectory` holding the status and
+state files, and `ExecStopPost=thermalctl restore`. The config is read at start only;
+there is no reload signal yet.

@@ -1,0 +1,24 @@
+[Unit]
+Description=Thermal Control Linux fan controller
+After=local-fs.target
+# The status file is read by hostwatch; the service has no network dependency.
+
+[Service]
+# The service sends READY=1 and WATCHDOG=1 itself over NOTIFY_SOCKET.
+Type=notify
+NotifyAccess=main
+ExecStart=/opt/thermalctl/venv/bin/thermalctl run --config /etc/thermalctl/config.toml
+# Runs after the service ends for any reason, including SIGKILL and a watchdog kill, and
+# puts every fan back to the mode recorded at start.
+ExecStopPost=/opt/thermalctl/venv/bin/thermalctl restore
+Restart=always
+RestartSec=2
+# The loop pings every cycle (2 s). A hung loop is killed after 30 s and restarted.
+WatchdogSec=30
+RuntimeDirectory=thermalctl
+RuntimeDirectoryPreserve=yes
+TimeoutStopSec=20
+User=root
+
+[Install]
+WantedBy=multi-user.target

@@ -12,7 +12,7 @@ mode = "dry_run"
 id = "cpu"
 # UNVERIFIED placeholder path.
 temperature_input = "/sys/class/hwmon/hwmon0/temp1_input"
-# UNVERIFIED placeholder name; the load reader arrives with the controller slice.
+# The only supported load input name, read from /proc/stat by the service.
 load_input = "cpu_load_percent"
 # Points are [temperature in C, duty percent]. Quiet when cool, full at 80 C.
 temperature_curve = [[40, 20], [55, 35], [70, 70], [80, 100]]
