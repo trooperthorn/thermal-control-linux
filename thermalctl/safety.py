@@ -178,6 +178,7 @@ class HeaderSafety:
         rpm: float | None,
         commanded: float | None,
         config_valid: bool = True,
+        extra_causes: tuple[str, ...] = (),
     ) -> str:
         """Evaluate one cycle and return the new state."""
         causes: list[str] = []
@@ -185,6 +186,7 @@ class HeaderSafety:
             causes.append(INVALID_CONFIG)
         if self._exiting:
             causes.append(EXITING)
+        causes += extra_causes
         causes += input_causes(zones, readings, now)
         causes += self._stall_causes(now, commanded, rpm)
         self._apply(now, causes)

@@ -161,3 +161,17 @@ def test_plausible_range_defaults_and_is_configurable():
     data = mutated(zone_update(plausible_min_c=-10, plausible_max_c=120))
     zone = parse_config(data).zones[0]
     assert (zone.plausible_min_c, zone.plausible_max_c) == (-10.0, 120.0)
+
+
+def test_example_uses_chip_names_and_leaves_the_fanless_header_out():
+    cfg = load_config(EXAMPLE)
+    assert [h.id for h in cfg.headers] == ["pwm1", "pwm2", "pwm3", "pwm4"]
+    assert all(h.path == f"nct6779:{h.id}" for h in cfg.headers)
+    assert all(not h.mapped for h in cfg.headers)
+    assert "pwm5" not in EXAMPLE.read_text(encoding="utf-8").split("[[headers]]", 1)[1]
+
+
+def test_misspelled_chip_reference_is_rejected():
+    data = mutated(lambda d: d["headers"][0].update(path="nct6779:fan2"))
+    with pytest.raises(ConfigError):
+        parse_config(data)

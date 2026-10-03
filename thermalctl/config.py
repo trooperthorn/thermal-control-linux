@@ -7,6 +7,7 @@ enter fail-safe, so validation is strict and rejects anything ambiguous.
 from __future__ import annotations
 
 import math
+import re
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +18,8 @@ MODES = ("dry_run", "active")
 TEMP_RANGE = (-50.0, 150.0)
 LOAD_RANGE = (0.0, 100.0)
 DEFAULT_PLAUSIBLE_TEMP = (-20.0, 150.0)
+# A chip reference such as nct6779:pwm2, resolved to the current hwmonN at start.
+CHIP_REF = re.compile(r"^(?P<chip>[A-Za-z0-9_.-]+):(?P<file>(?:pwm\d+|temp\d+_input))$")
 
 
 class ConfigError(ValueError):
@@ -176,9 +179,16 @@ def _header(table: object, index: int, zone_ids: set[str]) -> Header:
     for z in zones:
         if z not in zone_ids:
             raise ConfigError(f"{where}: unknown zone {z}")
+    path = _string(table, "path", where)
+    # A value with a colon and no separator is meant as a chip reference. A misspelled
+    # one would be opened as a relative file and read as a dead fan, so reject it.
+    if ":" in path and "/" not in path and "\\" not in path and not CHIP_REF.match(path):
+        raise ConfigError(
+            f"{where}: path must be a file path or a chip reference like nct6779:pwm2"
+        )
     return Header(
         id=hid,
-        path=_string(table, "path", where),
+        path=path,
         mapped=mapped,
         min_duty=_duty(table.get("min_duty"), f"{where}: min_duty"),
         min_rpm=int(min_rpm),

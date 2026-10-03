@@ -88,6 +88,8 @@ class SysfsBackend:
         self.input_scale = input_scale
         self.originals: dict[str, int] = {}
         self.restore_failures: list[str] = []
+        # The pwmN_enable value this backend last set per header; anything else is foreign.
+        self.expected: dict[str, int] = {}
         self.started = False
 
     def _controlled(self, header_id: str) -> bool:
@@ -122,6 +124,7 @@ class SysfsBackend:
             self._save_state()
             for header_id in sorted(self.originals):
                 _write_int(_enable_path(self.headers[header_id]), MANUAL)
+                self.expected[header_id] = MANUAL
         except (OSError, ValueError) as exc:
             self.restore()
             raise BackendError(f"cannot take control of fans: {exc}") from exc
@@ -156,6 +159,7 @@ class SysfsBackend:
             else:
                 if not full_speed_written:
                     log.error("%s restored to mode %s without a full speed write", header_id, original)
+        self.expected = {}
         if not self.restore_failures:
             self.originals = {}
             try:
@@ -213,6 +217,20 @@ class SysfsBackend:
             return
         _write_int(self.headers[header_id], duty_to_pwm(duty))
 
+    def owns(self, header_id: str) -> bool:
+        """False when pwmN_enable no longer holds the value this backend last set.
+
+        Something else (a fan utility, firmware, another script) wrote the mode, so this
+        service no longer knows what the fan is doing. An unreadable file counts as lost.
+        """
+        expected = self.expected.get(header_id)
+        if expected is None or not self._controlled(header_id):
+            return True
+        try:
+            return int(_read_text(_enable_path(self.headers[header_id]))) == expected
+        except (OSError, ValueError):
+            return False
+
     def release(self, header_id: str) -> None:
         """Hand one header back to its original mode, or full speed if that fails."""
         if not self._controlled(header_id):
@@ -220,6 +238,7 @@ class SysfsBackend:
         pwm = self.headers[header_id]
         try:
             _write_int(_enable_path(pwm), self.originals[header_id])
+            self.expected[header_id] = self.originals[header_id]
         except OSError as exc:
             log.error("release of %s failed (%s); writing full speed", header_id, exc)
             try:

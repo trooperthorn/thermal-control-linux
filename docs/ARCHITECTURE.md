@@ -31,6 +31,8 @@ says so. It is entered when any of these hold:
   than the stall window;
 - a header with a non-zero `min_rpm` reports less than that for longer than the stall
   window while commanded at or above its `min_rpm_duty`;
+- an enabled header's `pwmN_enable` no longer holds the value this service set, which
+  means something else took the header (reason `external_change:<id>`);
 - the config fails validation;
 - the controller is exiting for any reason.
 
@@ -47,6 +49,22 @@ logged. Hard floors: a minimum duty per header and a minimum RPM per header.
   apply; no runtime control loop.
 - **fake** (tests): an in-memory backend.
 
+## Ownership of the headers
+
+The service takes an exclusive lock on `thermalctl.lock` in its runtime directory
+(`/run/thermalctl`, beside the state file) before it touches hardware, and holds it until
+it exits. `thermalctl/lock.py` uses `flock` on POSIX. The kernel drops the lock when the
+process dies, even by SIGKILL, so a stale file never blocks anything. While the lock is
+held, `thermalctl restore` and `thermalctl map-headers --apply` refuse and change
+nothing, and a second `thermalctl run` refuses to start. `restore --force` skips the
+check; the unit uses it for `ExecStopPost`, which runs after the service has exited.
+
+The sysfs backend remembers the `pwmN_enable` value it last wrote for each header it
+controls (manual after start, the original after a release). Each cycle the controller
+asks `owns(header)` for every enabled header. If the file holds anything else, or cannot be
+read, the header goes to failsafe with `external_change:<id>`, is driven to full speed,
+and leaves failsafe only after the value is back and the hold period has passed.
+
 ## Header mapping test
 
 A header is never controlled until a supervised step test has proved which fan it drives:
@@ -59,6 +77,16 @@ The service writes `/run/thermalctl/status.json` atomically every cycle: version
 per header, duty, RPM, zone inputs, active curve, fail-safe reasons, last change. hostwatch
 reads that file read-only as a source and raises alerts for fail-safe, stall and over
 temperature. hostwatch does not set targets.
+
+## Chip names
+
+A header `path` or a zone `temperature_input` may be written `chip:file`, for example
+`nct6779:pwm2` or `coretemp:temp1_input`. `thermalctl/hwmon.py` scans
+`/sys/class/hwmon/hwmon*/name` once at start and replaces the reference with the real path,
+because the hwmonN index can change across boots. A chip that is not found, is found twice,
+or lacks the file makes `run` exit 1 before the lock, the state file or any fan is touched,
+so every fan stays under firmware control. `map-headers` resolves names the same way. A
+value with a colon and no path separator that is not a valid reference is a config error.
 
 ## Configuration and audit
 
@@ -147,7 +175,14 @@ header to full speed, or releases it to firmware when so configured, so it is ne
 in manual PWM at a low duty. A failsafe on one header resets only the smoothing history of
 its own zones.
 
-`Controller.reload(path)` validates a new config. An invalid file sets `config_valid` to
+`Controller.reload(path)` validates a new config (running it through the optional
+`config_transform`, which the CLI uses to resolve chip names; a failure there counts as an
+invalid file). It then refuses, without entering failsafe, any change the running backend
+cannot follow: dry run to active, a header that becomes mapped, or a mapped header whose
+path changes. The old config stays in force, the refusal is logged to `thermalctl.audit`,
+`reload` returns False, and the service must be restarted to apply the change. Stopping
+control (active to dry run, unmapping or removing a header) is still accepted and drives
+the header to full speed first. An invalid file sets `config_valid` to
 false, which puts every header in failsafe with `invalid_config`, keeps the old config
 from driving anything, and is logged. Every accepted change of mode, header mapping,
 paths, floors, zones or curves is logged to `thermalctl.audit` with old and new values, as
@@ -191,8 +226,9 @@ that cannot be read after that is still a missing input; any other `load_input` 
 is rejected by `check-config` and `run`. An invalid config at start leaves every fan
 untouched under firmware control and exits 1. `status` prints the status file and exits
 1 when it is missing or older than `--max-age`. `check-config PATH` validates only.
-`restore` calls `restore_from_state_file` on the persisted originals and exits 1 when the
-file is untrusted or any header fell back to full speed.
+`restore` first checks the ownership lock and exits 1 while another process holds it
+(`--force` skips that check), then calls `restore_from_state_file` on the persisted originals
+and exits 1 when the file is untrusted or any header fell back to full speed.
 
 `map-headers` prints the plan by default. With `--apply` it refuses unless stdin and
 stdout are terminals, then uses the backend (state file first) to lower one header at a
@@ -204,5 +240,5 @@ so it prints the result and the owner sets `mapped = true` by hand.
 library. `run` sends `READY=1` after start, `WATCHDOG=1` once per cycle and `STOPPING=1`
 on the way out. `packaging/thermalctl.service` is `Type=notify` with `WatchdogSec=30`
 against a 2 second cycle, `Restart=always`, a `RuntimeDirectory` holding the status and
-state files, and `ExecStopPost=thermalctl restore`. The config is read at start only;
+state files, and `ExecStopPost=thermalctl restore --force`. The config is read at start only;
 there is no reload signal yet.

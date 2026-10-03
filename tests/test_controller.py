@@ -284,3 +284,71 @@ def test_implausible_temperature_forces_failsafe(tmp_path, temp):
     assert doc["headers"]["pwm1"]["state"] == "failsafe"
     assert "invalid_input:temp" in doc["headers"]["pwm1"]["reasons"]
     assert rig.backend.writes[-1] == ("pwm1", 100.0)
+
+
+# -- reloads that need a restart ----------------------------------------------------
+
+
+def _write_reload(tmp_path, text):
+    new = tmp_path / "new.toml"
+    new.write_text(text, encoding="utf-8", newline="\n")
+    return new
+
+
+def test_reload_from_dry_run_to_active_is_refused(tmp_path, caplog):
+    rig = Rig(tmp_path, mode="dry_run")
+    rig.cycle()
+    with caplog.at_level(logging.ERROR, logger="thermalctl.audit"):
+        assert rig.ctl.reload(_write_reload(tmp_path, _reload_text("active", "true"))) is False
+    assert "mode dry_run->active" in caplog.text
+    assert rig.ctl.config.mode == "dry_run"
+    assert rig.ctl.config_valid is True
+    rig.cycle()
+    assert rig.backend.writes == []
+    assert rig.doc()["headers"]["pwm1"]["state"] == "dry_run"
+
+
+def test_reload_that_maps_another_header_is_refused(tmp_path):
+    rig = Rig(tmp_path)
+    text = _reload_text("active", "true").replace("false", "true")
+    assert rig.ctl.reload(_write_reload(tmp_path, text)) is False
+    assert [h.mapped for h in rig.ctl.config.headers] == [True, False]
+
+
+def test_reload_that_moves_a_mapped_header_path_is_refused(tmp_path):
+    rig = Rig(tmp_path)
+    text = _reload_text("active", "true").replace("/fake/pwm1", "/fake/other1")
+    assert rig.ctl.reload(_write_reload(tmp_path, text)) is False
+    assert rig.ctl.config.headers[0].path == "/fake/pwm1"
+
+
+def test_reload_applies_the_config_transform(tmp_path):
+    rig = Rig(tmp_path)
+    rig.ctl.config_transform = lambda c: c
+    assert rig.ctl.reload(_write_reload(tmp_path, _reload_text("active", "true"))) is True
+
+
+def test_failing_config_transform_rejects_the_reload(tmp_path):
+    rig = Rig(tmp_path)
+
+    def boom(config):
+        raise ValueError("chip gone")
+
+    rig.ctl.config_transform = boom
+    assert rig.ctl.reload(_write_reload(tmp_path, _reload_text("active", "true"))) is False
+    assert rig.ctl.config_valid is False
+
+
+def test_external_change_puts_a_header_in_failsafe_and_recovers_after_the_hold(tmp_path):
+    rig = Rig(tmp_path)
+    rig.set_inputs(30.0, 0.0)
+    rig.cycle()
+    rig.backend.foreign = {"pwm1"}
+    doc = rig.cycle()
+    assert doc["headers"]["pwm1"]["state"] == "failsafe"
+    assert doc["headers"]["pwm1"]["reasons"] == ["external_change:pwm1"]
+    assert rig.backend.writes[-1] == ("pwm1", 100.0)
+    rig.backend.foreign = set()
+    for _ in range(10):
+        doc = rig.cycle()
+    assert doc["headers"]["pwm1"]["state"] == "active"

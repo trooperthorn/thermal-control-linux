@@ -24,7 +24,9 @@ from .backends.sysfs import (
 )
 from .config import Config, ConfigError, load_config
 from .controller import DEFAULT_STATUS_PATH, Controller
+from .hwmon import DEFAULT_HWMON_ROOT, HwmonError, resolve_config
 from .load import SUPPORTED_LOAD_INPUTS, LoadBackend
+from .lock import LockHeld, OwnerLock, default_lock_path, is_held
 from .mapping import plan_lines, run_mapping
 from .notify import Notifier
 
@@ -46,6 +48,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--status-path", default=DEFAULT_STATUS_PATH)
     run.add_argument("--state-file", default=DEFAULT_STATE_FILE)
     run.add_argument("--interval", type=float, default=DEFAULT_INTERVAL_S, help="seconds per cycle")
+    run.add_argument("--lock-file", default=None, help="ownership lock (default: beside the state file)")
+    run.add_argument("--hwmon-root", default=DEFAULT_HWMON_ROOT, help=argparse.SUPPRESS)
 
     status = sub.add_parser("status", help="print the status file the service writes")
     status.add_argument("--status-path", default=DEFAULT_STATUS_PATH)
@@ -57,10 +61,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     restore = sub.add_parser("restore", help="restore the persisted original fan modes")
     restore.add_argument("--state-file", default=DEFAULT_STATE_FILE)
+    restore.add_argument("--lock-file", default=None, help="ownership lock (default: beside the state file)")
+    restore.add_argument(
+        "--force",
+        action="store_true",
+        help="restore even if the lock is held; for ExecStopPost, which runs after the service exits",
+    )
 
     mapping = sub.add_parser("map-headers", help="guided test of which fan each header drives")
     mapping.add_argument("--config", required=True, metavar="PATH")
     mapping.add_argument("--state-file", default=DEFAULT_STATE_FILE)
+    mapping.add_argument("--lock-file", default=None, help="ownership lock (default: beside the state file)")
+    mapping.add_argument("--hwmon-root", default=DEFAULT_HWMON_ROOT, help=argparse.SUPPRESS)
     mapping.add_argument(
         "--apply",
         action="store_true",
@@ -111,6 +123,8 @@ def run_service(
     sleep: Callable[[float], None] = time.sleep,
     notifier: Notifier | None = None,
     proc_stat: str = "/proc/stat",
+    lock_file: str | None = None,
+    hwmon_root: str = DEFAULT_HWMON_ROOT,
 ) -> int:
     notifier = Notifier() if notifier is None else notifier
     try:
@@ -123,6 +137,39 @@ def run_service(
         for problem in problems:
             _err(problem)
         return 1
+    # Resolve chip names before anything else, so a missing chip leaves every fan alone.
+    try:
+        config = resolve_config(config, hwmon_root)
+    except HwmonError as exc:
+        _err(f"cannot find fan hardware, fans stay under firmware control: {exc}")
+        return 1
+    lock = OwnerLock(lock_file or default_lock_path(state_file))
+    try:
+        lock.acquire(create_dir=True)
+    except (LockHeld, OSError) as exc:
+        _err(f"cannot take the ownership lock: {exc}")
+        return 1
+    try:
+        return _serve(
+            config, config_path, status_path, state_file, interval_s,
+            should_stop, sleep, notifier, proc_stat, hwmon_root,
+        )
+    finally:
+        lock.release()
+
+
+def _serve(
+    config: Config,
+    config_path: str,
+    status_path: str,
+    state_file: str,
+    interval_s: float,
+    should_stop: Callable[[], bool],
+    sleep: Callable[[float], None],
+    notifier: Notifier,
+    proc_stat: str,
+    hwmon_root: str,
+) -> int:
     if config.mode != "active":
         log.info("mode is dry_run: computing and logging only, no hardware writes")
     sysfs = build_backend(config, state_file)
@@ -135,7 +182,10 @@ def run_service(
     try:
         with sysfs:
             backend = LoadBackend(sysfs, proc_stat)
-            controller = Controller(config, backend, status_path=status_path)
+            controller = Controller(
+                config, backend, status_path=status_path,
+                config_transform=lambda c: resolve_config(c, hwmon_root),
+            )
             notifier.ready()
             try:
                 controller.run(interval_s, should_stop, sleep=tick)
@@ -194,6 +244,13 @@ def cmd_check_config(args: argparse.Namespace) -> int:
 
 
 def cmd_restore(args: argparse.Namespace) -> int:
+    lock_path = args.lock_file or default_lock_path(args.state_file)
+    if not args.force and is_held(lock_path):
+        _err(
+            f"the service holds {lock_path}; stop it first, or use --force "
+            "(only for ExecStopPost, after the service has exited)"
+        )
+        return 1
     try:
         fallbacks = restore_from_state_file(args.state_file)
     except StateFileError as exc:
@@ -218,6 +275,11 @@ def cmd_map_headers(
     except ConfigError as exc:
         _err(f"invalid config: {exc}")
         return 1
+    try:
+        config = resolve_config(config, args.hwmon_root)
+    except HwmonError as exc:
+        _err(f"cannot find fan hardware: {exc}")
+        return 1
     for line in plan_lines(config):
         _out(line)
     if not args.apply:
@@ -229,6 +291,15 @@ def cmd_map_headers(
     if settle is None:
         def settle() -> None:
             time.sleep(MAPPING_SETTLE_S)
+    lock = OwnerLock(args.lock_file or default_lock_path(args.state_file))
+    try:
+        lock.acquire()
+    except LockHeld:
+        _err(f"the service holds {lock.path}; stop it before running the mapping test")
+        return 1
+    except OSError as exc:
+        _err(f"cannot take the ownership lock: {exc}")
+        return 1
     install_signal_handlers()
     try:
         run_mapping(config, args.state_file, ask=ask, say=_out, settle=settle)
@@ -240,6 +311,8 @@ def cmd_map_headers(
         return 1
     except SystemExit as exc:
         return exc.code if isinstance(exc.code, int) else 1
+    finally:
+        lock.release()
     return 0
 
 
@@ -256,7 +329,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.interval <= 0:
             _err("--interval must be positive")
             return 2
-        return run_service(args.config, args.status_path, args.state_file, args.interval)
+        return run_service(
+            args.config, args.status_path, args.state_file, args.interval,
+            lock_file=args.lock_file, hwmon_root=args.hwmon_root,
+        )
     if args.command == "status":
         return cmd_status(args)
     if args.command == "check-config":

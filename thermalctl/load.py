@@ -82,3 +82,6 @@ class LoadBackend:
 
     def release(self, header_id: str) -> None:
         self.inner.release(header_id)
+
+    def owns(self, header_id: str) -> bool:
+        return self.inner.owns(header_id)

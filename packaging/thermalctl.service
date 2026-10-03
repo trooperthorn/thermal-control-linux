@@ -9,8 +9,9 @@ Type=notify
 NotifyAccess=main
 ExecStart=/opt/thermalctl/venv/bin/thermalctl run --config /etc/thermalctl/config.toml
 # Runs after the service ends for any reason, including SIGKILL and a watchdog kill, and
-# puts every fan back to the mode recorded at start.
-ExecStopPost=/opt/thermalctl/venv/bin/thermalctl restore
+# puts every fan back to the mode recorded at start. --force skips the lock check, which
+# would otherwise refuse while the service is still shutting down.
+ExecStopPost=/opt/thermalctl/venv/bin/thermalctl restore --force
 Restart=always
 RestartSec=2
 # The loop pings every cycle (2 s). A hung loop is killed after 30 s and restarted.

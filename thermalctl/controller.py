@@ -27,6 +27,7 @@ from .smoothing import Ema, OutputShaper, apply_floor
 
 DEFAULT_STATUS_PATH = "/run/thermalctl/status.json"
 CYCLE_ERROR = "cycle_error"
+EXTERNAL_CHANGE = "external_change"
 
 audit = logging.getLogger("thermalctl.audit")
 log = logging.getLogger("thermalctl")
@@ -108,6 +109,7 @@ class Controller:
         hysteresis: float = 2.0,
         ramp_down_per_s: float = 2.0,
         failsafe_firmware: bool = False,
+        config_transform: Callable[[Config], Config] | None = None,
     ) -> None:
         self.backend = backend
         self.status_path = Path(status_path)
@@ -117,6 +119,8 @@ class Controller:
         self.hysteresis = hysteresis
         self.ramp_down_per_s = ramp_down_per_s
         self.failsafe_firmware = failsafe_firmware
+        # Applied to every reloaded config, for example to resolve chip names to paths.
+        self.config_transform = config_transform
         self.config_valid = True
         self.config = config
         self.safety: dict[str, HeaderSafety] = {}
@@ -186,13 +190,47 @@ class Controller:
             if header.id in self.shapers:
                 self.shapers[header.id].reset(100.0)
 
+    def _restart_required(self, old: Config, new: Config) -> list[str]:
+        """Changes the running backend cannot follow, which need a restart.
+
+        The backend recorded the original pwmN_enable of the headers that were mapped at
+        start, and in dry run it recorded nothing at all. Starting to drive a header it
+        never took over would write to a fan with no recorded mode to restore.
+        """
+        problems: list[str] = []
+        if old.mode == "dry_run" and new.mode == "active":
+            problems.append("mode dry_run->active")
+        old_headers = {h.id: h for h in old.headers}
+        for header in new.headers:
+            if not header.mapped:
+                continue
+            before = old_headers.get(header.id)
+            if before is None or not before.mapped:
+                problems.append(f"header {header.id} newly mapped")
+            elif before.path != header.path:
+                problems.append(f"header {header.id} path {before.path}->{header.path}")
+        return problems
+
     def reload(self, path: str | Path) -> bool:
-        """Load a config file. An invalid file keeps failsafe and the old config unused."""
+        """Load a config file. An invalid file keeps failsafe and the old config unused.
+
+        A change that needs a restart (dry run to active, or a newly mapped header or a
+        changed mapped path) is refused: the old config stays in force and nothing else
+        changes. Stopping control of a header is always allowed.
+        """
         try:
             new = load_config(path)
-        except ConfigError as exc:
+            if self.config_transform is not None:
+                new = self.config_transform(new)
+        except Exception as exc:
             audit.error("config reload rejected, failsafe stays in force: %s", exc)
             self.config_valid = False
+            return False
+        blocked = self._restart_required(self.config, new)
+        if blocked:
+            audit.error(
+                "config reload refused, restart the service to apply: %s", "; ".join(blocked)
+            )
             return False
         if not self.config_valid:
             audit.info("config valid again: invalid_config cleared, hold period applies")
@@ -267,8 +305,14 @@ class Controller:
             dt = 0.0 if self.last_time is None else max(0.0, now - self.last_time)
             zones = {z.id: z for z in self.config.zones}
             for header in self.config.headers:
+                lost = (
+                    (f"{EXTERNAL_CHANGE}:{header.id}",)
+                    if self._enabled(header) and not self.backend.owns(header.id)
+                    else ()
+                )
                 self.safety[header.id].update(
                     now,
+                    extra_causes=lost,
                     zones=[zones[z] for z in header.zones],
                     readings=readings,
                     rpm=rpms[header.id],

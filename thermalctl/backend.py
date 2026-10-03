@@ -25,6 +25,9 @@ class Backend(Protocol):
     def release(self, header_id: str) -> None:
         """Hand a header back to firmware control."""
 
+    def owns(self, header_id: str) -> bool:
+        """False when something else changed the header's mode since this service set it."""
+
 
 class FakeBackend:
     """In-memory backend. Set inputs, rpms and fail_reads to script a test."""
@@ -35,6 +38,7 @@ class FakeBackend:
         self.fail_reads = False
         self.writes: list[tuple[str, float]] = []
         self.releases: list[str] = []
+        self.foreign: set[str] = set()
 
     def read_inputs(self) -> Mapping[str, Reading]:
         if self.fail_reads:
@@ -49,3 +53,6 @@ class FakeBackend:
 
     def release(self, header_id: str) -> None:
         self.releases.append(header_id)
+
+    def owns(self, header_id: str) -> bool:
+        return header_id not in self.foreign

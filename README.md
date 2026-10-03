@@ -13,13 +13,15 @@ measured are listed in `UNVERIFIED.md`.
 - `thermalctl status` prints the status file the service writes. `--json` prints it raw.
   It exits non-zero when the file is missing or older than `--max-age` seconds.
 - `thermalctl check-config PATH` validates a config file and changes nothing. It rejects curves whose duty falls as the input rises and temperature curves that do not reach 100 percent at or below `hard_max_temp_c`.
-- `thermalctl restore` reads the persisted original fan modes and puts them back. The
+- `thermalctl restore` refuses while the running service holds the ownership lock; `--force`
+  skips that check and is what the unit uses after the service has exited. It reads the persisted original fan modes and puts them back. The
   systemd unit runs it as `ExecStopPost`, so it also runs after the service was killed.
   It writes full speed (pwm 255) to each header before restoring its mode, so a header
   whose original mode was manual (1) is left at full speed, not at its last low duty.
 - `thermalctl map-headers --config PATH` prints the plan for the header mapping test.
   With `--apply`, and only on a terminal, it lowers one header at a time, shows which fan
-  input fell, and restores the original mode before moving on.
+  input fell, and restores the original mode before moving on. It refuses while the
+  service holds the ownership lock, so stop the service first.
 
 ## Install on Debian
 
@@ -50,7 +52,17 @@ with the temperatures for a while. Only then run the mapping test for each heade
 The first command only prints the plan. Set `mapped = true` on a header only after you
 have confirmed which fan it drives, and change `mode` to `"active"` last. A change of
 mode, mapping, curve or floor is written to the journal with the old and new values.
-The service reads its config at start; restart it to apply a change.
+The service reads its config at start. A reload that switches from dry run to active, or
+maps a header or changes a mapped header's path, is refused and logged; restart the service
+to apply those changes.
+
+## Header names and ownership
+
+Write header paths as `chip:pwmN` (for example `nct6779:pwm2`) and zone inputs as
+`chip:tempN_input`. The service resolves the chip by its hwmon `name` at start, because the
+hwmonN number can change across boots. If the chip is missing it exits without touching any
+fan. The service holds a lock under `/run/thermalctl` while it runs, and it puts a header
+in fail-safe if something else changes that header's `pwmN_enable`.
 
 ## Stall and minimum RPM
 
