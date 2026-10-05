@@ -23,7 +23,7 @@ from .backends.sysfs import (
     install_signal_handlers,
     restore_from_state_file,
 )
-from .config import Config, ConfigError, load_config
+from .config import DEFAULT_OVERRIDES_PATH, Config, ConfigError, load_config, load_effective
 from .controller import DEFAULT_STATUS_PATH, Controller
 from .hwmon import DEFAULT_HWMON_ROOT, HwmonError, resolve_config
 from .load import SUPPORTED_LOAD_INPUTS, LoadBackend
@@ -50,6 +50,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--state-file", default=DEFAULT_STATE_FILE)
     run.add_argument("--interval", type=float, default=DEFAULT_INTERVAL_S, help="seconds per cycle")
     run.add_argument("--lock-file", default=None, help="ownership lock (default: beside the state file)")
+    run.add_argument("--overrides", default=DEFAULT_OVERRIDES_PATH, metavar="PATH",
+                     help="optional root-owned overrides file merged over the config")
     run.add_argument("--hwmon-root", default=DEFAULT_HWMON_ROOT, help=argparse.SUPPRESS)
 
     status = sub.add_parser("status", help="print the status file the service writes")
@@ -59,6 +61,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     check = sub.add_parser("check-config", help="validate a config file and change nothing")
     check.add_argument("path", metavar="PATH")
+    check.add_argument("--overrides", default=DEFAULT_OVERRIDES_PATH, metavar="PATH",
+                       help="optional root-owned overrides file merged over the config")
 
     restore = sub.add_parser("restore", help="restore the persisted original fan modes")
     restore.add_argument("--state-file", default=DEFAULT_STATE_FILE)
@@ -131,13 +135,18 @@ def run_service(
     proc_stat: str = "/proc/stat",
     lock_file: str | None = None,
     hwmon_root: str = DEFAULT_HWMON_ROOT,
+    overrides_path: str = DEFAULT_OVERRIDES_PATH,
 ) -> int:
     notifier = Notifier() if notifier is None else notifier
     try:
-        config = load_config(config_path)
+        config, report = load_effective(config_path, overrides_path)
     except ConfigError as exc:
         _err(f"invalid config, fans stay under firmware control: {exc}")
         return 1
+    if report.ignored:
+        _err(f"{report.path}: {report.ignored}")
+    elif report.applied:
+        log.info("overrides applied from %s", report.path)
     problems = validate_for_service(config)
     if problems:
         for problem in problems:
@@ -158,7 +167,7 @@ def run_service(
     try:
         return _serve(
             config, config_path, status_path, state_file, interval_s,
-            should_stop, sleep, notifier, proc_stat, hwmon_root,
+            should_stop, sleep, notifier, proc_stat, hwmon_root, overrides_path,
         )
     finally:
         lock.release()
@@ -175,6 +184,7 @@ def _serve(
     notifier: Notifier,
     proc_stat: str,
     hwmon_root: str,
+    overrides_path: str,
 ) -> int:
     if config.mode != "active":
         log.info("mode is dry_run: computing and logging only, no hardware writes")
@@ -191,6 +201,7 @@ def _serve(
             controller = Controller(
                 config, backend, status_path=status_path,
                 config_transform=lambda c: resolve_config(c, hwmon_root),
+                overrides_path=overrides_path,
             )
             notifier.ready()
             try:
@@ -244,7 +255,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 def cmd_check_config(args: argparse.Namespace) -> int:
     try:
-        config = load_config(args.path)
+        config, report = load_effective(args.path, args.overrides)
     except ConfigError as exc:
         _err(f"invalid: {exc}")
         return 1
@@ -258,6 +269,16 @@ def cmd_check_config(args: argparse.Namespace) -> int:
     _out(f"mapped headers: {', '.join(mapped) if mapped else 'none'}")
     if config.mode == "active" and not mapped:
         _out("note: active mode controls nothing until a header is mapped")
+    if report.ignored:
+        _err(f"{report.path}: {report.ignored}")
+        _out("overrides: ignored")
+    elif report.applied:
+        _out(f"overrides: applied from {report.path}")
+    else:
+        _out(f"overrides: none ({report.path} not found)")
+    for header in config.headers:
+        note = " (overridden)" if header.id in report.min_duty else ""
+        _out(f"effective {header.id}: min_duty {header.min_duty:g}{note}")
     return 0
 
 
@@ -356,6 +377,7 @@ def main(argv: list[str] | None = None) -> int:
         return run_service(
             args.config, args.status_path, args.state_file, args.interval,
             lock_file=args.lock_file, hwmon_root=args.hwmon_root,
+            overrides_path=args.overrides,
         )
     if args.command == "status":
         return cmd_status(args)

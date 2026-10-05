@@ -107,6 +107,8 @@ problem, which the controller treats as a fail-safe cause. The top level holds `
 - A header has `id`, `path`, `mapped` (default false), `min_duty`, `min_rpm`,
   `stall_window_s`, `zones`, a list of zone ids that must exist, and optionally
   `min_rpm_duty` (default 50), the commanded duty from which `min_rpm` is enforced.
+- A header may also set `min_duty_limit` (default `min_duty`, never above it), the lowest
+  floor an override may set.
 - A zone may set `plausible_min_c` and `plausible_max_c` (defaults -20 and 150). Readings
   outside them are treated as sensor faults. `hard_max_temp_c` may not exceed the
   plausible maximum.
@@ -116,6 +118,18 @@ problem, which the controller treats as a fail-safe cause. The top level holds `
   already means full speed. Temperature inputs must lie in -50 to 150 C, load inputs in 0 to 100
   percent, and every duty in 0 to 100.
 - Ids are unique within zones and within headers.
+
+### Overrides file
+
+`apply_overrides` in `thermalctl/config.py` merges `/etc/thermalctl/overrides.toml` (or
+`--overrides PATH`) over a validated `Config` and returns the merged config with an
+`OverrideReport`; `load_effective` loads the main file and does both. The main file is
+never rewritten. Only `mode` and `[headers.<id>] min_duty` are allowed. A floor must be
+0 to 100, at or above the header's `min_duty_limit`, and for a mapped header that exists;
+`mode = "active"` needs every header mapped. Any violation raises `ConfigError`. On POSIX
+a file not owned by root or writable by group or others is ignored with an error, not
+applied. A missing file is no overrides. `Controller.reload` merges the same file, and a
+mode change is still refused until restart. `check-config` prints the effective values.
 
 `thermalctl/curves.py` interpolates linearly between points and clamps at both ends.
 The zone duty is the larger of the temperature and load curve values. `docs/example.toml`

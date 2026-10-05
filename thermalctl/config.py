@@ -6,14 +6,17 @@ enter fail-safe, so validation is strict and rejects anything ambiguous.
 
 from __future__ import annotations
 
+import dataclasses
 import math
+import os
 import re
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .curves import Point
 
+DEFAULT_OVERRIDES_PATH = "/etc/thermalctl/overrides.toml"
 MODES = ("dry_run", "active")
 TEMP_RANGE = (-50.0, 150.0)
 LOAD_RANGE = (0.0, 100.0)
@@ -49,6 +52,8 @@ class Header:
     stall_window_s: float
     zones: tuple[str, ...]
     min_rpm_duty: float = 50.0
+    # The lowest floor an override may set; None means the header's own min_duty.
+    min_duty_limit: float | None = None
 
 
 @dataclass(frozen=True)
@@ -186,15 +191,20 @@ def _header(table: object, index: int, zone_ids: set[str]) -> Header:
         raise ConfigError(
             f"{where}: path must be a file path or a chip reference like nct6779:pwm2"
         )
+    min_duty = _duty(table.get("min_duty"), f"{where}: min_duty")
+    min_duty_limit = _duty(table.get("min_duty_limit", min_duty), f"{where}: min_duty_limit")
+    if min_duty_limit > min_duty:
+        raise ConfigError(f"{where}: min_duty_limit must not be above min_duty")
     return Header(
         id=hid,
         path=path,
         mapped=mapped,
-        min_duty=_duty(table.get("min_duty"), f"{where}: min_duty"),
+        min_duty=min_duty,
         min_rpm=int(min_rpm),
         stall_window_s=_positive(table, "stall_window_s", where),
         zones=tuple(zones),
         min_rpm_duty=_duty(table.get("min_rpm_duty", 50), f"{where}: min_rpm_duty"),
+        min_duty_limit=min_duty_limit,
     )
 
 
@@ -230,3 +240,118 @@ def load_config(path: str | Path) -> Config:
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"config is not valid TOML: {exc}") from exc
     return parse_config(data)
+
+
+@dataclass(frozen=True)
+class OverrideReport:
+    """What happened to the overrides file, for check-config and the service log."""
+
+    path: str
+    applied: bool = False
+    # Why the file was not applied: None when applied or when no file exists.
+    ignored: str | None = None
+    mode: str | None = None
+    min_duty: dict[str, float] = field(default_factory=dict)
+
+
+def _posix() -> bool:
+    return os.name == "posix"
+
+
+def _stat_file(path: str | Path) -> os.stat_result:
+    return os.stat(path)
+
+
+def _insecure_reason(st: os.stat_result) -> str | None:
+    """Why a POSIX overrides file cannot be trusted, or None when it can."""
+    if st.st_uid != 0:
+        return "it is not owned by root"
+    if st.st_mode & 0o022:
+        return "it is writable by its group or by others"
+    return None
+
+
+def _parse_overrides(data: dict, config: Config) -> tuple[str | None, dict[str, float]]:
+    unknown = sorted(set(data) - {"mode", "headers"})
+    if unknown:
+        raise ConfigError(f"overrides: key {unknown[0]!r} is not allowed")
+    mode = data.get("mode")
+    if mode is not None and mode not in MODES:
+        raise ConfigError(f"overrides: mode must be one of {', '.join(MODES)}")
+    raw = data.get("headers", {})
+    if not isinstance(raw, dict):
+        raise ConfigError("overrides: headers must be a table of header tables")
+    by_id = {h.id: h for h in config.headers}
+    floors: dict[str, float] = {}
+    for hid, table in raw.items():
+        where = f"overrides: header {hid}"
+        header = by_id.get(hid)
+        if header is None:
+            raise ConfigError(f"{where} is not in the config")
+        if not isinstance(table, dict):
+            raise ConfigError(f"{where} must be a table")
+        extra = sorted(set(table) - {"min_duty"})
+        if extra:
+            raise ConfigError(f"{where}: key {extra[0]!r} is not allowed")
+        if "min_duty" not in table:
+            continue
+        if not header.mapped:
+            raise ConfigError(f"{where} is not mapped, so its floor cannot be overridden")
+        duty = _duty(table["min_duty"], f"{where}: min_duty")
+        limit = header.min_duty if header.min_duty_limit is None else header.min_duty_limit
+        if duty < limit:
+            raise ConfigError(
+                f"{where}: min_duty {duty:g} is below the allowed minimum {limit:g}"
+            )
+        floors[hid] = duty
+    if mode == "active":
+        unmapped = [h.id for h in config.headers if not h.mapped]
+        if unmapped:
+            raise ConfigError(
+                "overrides: mode active needs every header mapped; unmapped: "
+                + ", ".join(unmapped)
+            )
+    return mode, floors
+
+
+def apply_overrides(
+    config: Config, overrides_path: str | Path | None
+) -> tuple[Config, OverrideReport]:
+    """Merge the optional overrides file over a validated config.
+
+    A missing file means no overrides. A file that is not root-owned or is group or world
+    writable (checked on POSIX only) is ignored. Any other problem is a ConfigError.
+    The main config file is never rewritten.
+    """
+    path = str(overrides_path or DEFAULT_OVERRIDES_PATH)
+    try:
+        st = _stat_file(path)
+    except FileNotFoundError:
+        return config, OverrideReport(path)
+    except OSError as exc:
+        raise ConfigError(f"cannot read overrides: {exc}") from exc
+    if _posix():
+        reason = _insecure_reason(st)
+        if reason is not None:
+            return config, OverrideReport(path, ignored=f"overrides ignored, {reason}")
+    try:
+        with open(path, "rb") as handle:
+            data = tomllib.load(handle)
+    except OSError as exc:
+        raise ConfigError(f"cannot read overrides: {exc}") from exc
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(f"overrides are not valid TOML: {exc}") from exc
+    mode, floors = _parse_overrides(data, config)
+    headers = tuple(
+        dataclasses.replace(h, min_duty=floors[h.id]) if h.id in floors else h
+        for h in config.headers
+    )
+    merged = Config(mode=mode or config.mode, zones=config.zones, headers=headers)
+    return merged, OverrideReport(path, applied=True, mode=mode, min_duty=floors)
+
+
+def load_effective(
+    path: str | Path, overrides_path: str | Path | None = None
+) -> tuple[Config, OverrideReport]:
+    """Load the main config and merge the overrides file over it."""
+    return apply_overrides(load_config(path), overrides_path)

@@ -20,7 +20,7 @@ from pathlib import Path
 
 from . import __version__
 from .backend import Backend
-from .config import Config, ConfigError, Header, load_config
+from .config import Config, ConfigError, Header, load_effective
 from .curves import zone_duty
 from .hwmon import HwmonError
 from .safety import FAILSAFE, LOAD_WARMING_UP, HeaderSafety, Reading, failsafe_duty
@@ -111,6 +111,7 @@ class Controller:
         ramp_down_per_s: float = 2.0,
         failsafe_firmware: bool = False,
         config_transform: Callable[[Config], Config] | None = None,
+        overrides_path: str | Path | None = None,
     ) -> None:
         self.backend = backend
         self.status_path = Path(status_path)
@@ -122,6 +123,8 @@ class Controller:
         self.failsafe_firmware = failsafe_firmware
         # Applied to every reloaded config, for example to resolve chip names to paths.
         self.config_transform = config_transform
+        # The overrides file merged over every reloaded config; None uses the default path.
+        self.overrides_path = overrides_path
         self.config_valid = True
         self.config = config
         self.safety: dict[str, HeaderSafety] = {}
@@ -220,7 +223,7 @@ class Controller:
         changes. Stopping control of a header is always allowed.
         """
         try:
-            new = load_config(path)
+            new, _ = load_effective(path, self.overrides_path)
             if self.config_transform is not None:
                 new = self.config_transform(new)
         except (ConfigError, HwmonError) as exc:

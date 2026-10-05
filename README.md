@@ -10,6 +10,7 @@ measured are listed in `UNVERIFIED.md`.
 
 - `thermalctl run --config PATH` runs the control loop. It is a dry run unless the config
   says `mode = "active"`, and even then it writes only to headers marked `mapped = true`.
+- `thermalctl run` and `check-config` also read an optional overrides file, `/etc/thermalctl/overrides.toml` by default or `--overrides PATH`. See the overrides section below.
 - `thermalctl status` prints the status file the service writes: each zone's temperature and CPU load, then each header's state, duty, RPM and reasons. `--json` prints it raw.
   It exits non-zero when the file is missing or older than `--max-age` seconds.
 - `thermalctl check-config PATH` validates a config file and changes nothing. It rejects curves whose duty falls as the input rises and temperature curves that do not reach 100 percent at or below `hard_max_temp_c`.
@@ -68,6 +69,26 @@ mode, mapping, curve or floor is written to the journal with the old and new val
 The service reads its config at start. A reload that switches from dry run to active, or
 maps a header or changes a mapped header's path, is refused and logged; restart the service
 to apply those changes.
+
+## Overrides file
+
+A root-owned file, `/etc/thermalctl/overrides.toml`, may change two things without
+rewriting the main config: the `mode` and, per header, `min_duty`. It is merged over the
+main config at start and on reload. Any other key is rejected.
+
+    mode = "active"
+
+    [headers.pwm2]
+    min_duty = 20
+
+Each header may set `min_duty_limit` in the main config, the lowest floor an override may
+set; it defaults to the header's own `min_duty` and may not be above it. An override below
+the limit, above 100, for an unknown header or for an unmapped header is rejected, and so
+is `mode = "active"` while any header is unmapped. A rejected file is a config error, so
+`run` exits 1 and leaves the fans under firmware control. On POSIX the file must be owned
+by root and not writable by its group or others; otherwise it is ignored and an error is
+printed. A missing file means no overrides. `check-config` prints whether overrides were
+applied and the effective `min_duty` of every header. A mode change still needs a restart.
 
 ## Header names and ownership
 
