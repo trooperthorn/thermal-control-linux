@@ -20,7 +20,10 @@ from pathlib import Path
 
 from . import __version__
 from .backend import Backend
-from .config import Config, ConfigError, Header, load_effective
+from .config import (
+    DEFAULT_OVERRIDES_PATH, Config, ConfigError, Header, OverrideReport, apply_overrides,
+    load_config,
+)
 from .curves import zone_duty
 from .hwmon import HwmonError
 from .safety import FAILSAFE, LOAD_WARMING_UP, HeaderSafety, Reading, failsafe_duty
@@ -112,6 +115,8 @@ class Controller:
         failsafe_firmware: bool = False,
         config_transform: Callable[[Config], Config] | None = None,
         overrides_path: str | Path | None = None,
+        config_path: str | Path | None = None,
+        overrides_report: OverrideReport | None = None,
     ) -> None:
         self.backend = backend
         self.status_path = Path(status_path)
@@ -125,6 +130,16 @@ class Controller:
         self.config_transform = config_transform
         # The overrides file merged over every reloaded config; None uses the default path.
         self.overrides_path = overrides_path
+        # The main config file the running config came from. When set, cycle() reloads it on
+        # a reload request (SIGHUP) or when the overrides file changes on disk.
+        self.config_path = config_path
+        self.reload_requested = False
+        report = overrides_report if overrides_report is not None else OverrideReport("")
+        self.overrides_applied = report.applied
+        self.overrides_mode = report.mode
+        # Why the last overrides reload was rejected or ignored; None when all is well.
+        self.overrides_error: str | None = report.ignored
+        self._overrides_stamp = self._stat_overrides()
         self.config_valid = True
         self.config = config
         self.safety: dict[str, HeaderSafety] = {}
@@ -223,12 +238,28 @@ class Controller:
         changes. Stopping control of a header is always allowed.
         """
         try:
-            new, _ = load_effective(path, self.overrides_path)
+            new = load_config(path)
             if self.config_transform is not None:
                 new = self.config_transform(new)
         except (ConfigError, HwmonError) as exc:
             audit.error("config reload rejected, failsafe stays in force: %s", exc)
             self.config_valid = False
+            return False
+        # A bad overrides file is not a bad config: the previous effective config stays in
+        # force, nothing goes to failsafe, and the reason is published in the status file.
+        try:
+            new, report = apply_overrides(new, self.overrides_path)
+        except ConfigError as exc:
+            self.overrides_error = str(exc)
+            audit.error("overrides rejected, previous effective config kept: %s", exc)
+            return False
+        if new.mode != self.config.mode and (
+            report.mode is not None or self.overrides_mode is not None
+        ):
+            self.overrides_error = (
+                f"mode {self.config.mode}->{new.mode} from overrides needs a restart"
+            )
+            audit.error("overrides reload refused, %s", self.overrides_error)
             return False
         blocked = self._restart_required(self.config, new)
         if blocked:
@@ -245,7 +276,35 @@ class Controller:
             self.config = new
             self._build(new)
         self.config_valid = True
+        self.overrides_applied = report.applied
+        self.overrides_mode = report.mode
+        self.overrides_error = report.ignored
         return True
+
+    def _stat_overrides(self) -> tuple[int, int] | None:
+        """A cheap fingerprint of the overrides file, None when it does not exist."""
+        try:
+            st = os.stat(self.overrides_path or DEFAULT_OVERRIDES_PATH)
+        except OSError:
+            return None
+        return (st.st_mtime_ns, st.st_size)
+
+    def request_reload(self) -> None:
+        """Ask for a reload at the start of the next cycle; safe to call from a signal handler."""
+        self.reload_requested = True
+
+    def _poll_reload(self) -> None:
+        if self.config_path is None:
+            return
+        stamp = self._stat_overrides()
+        if not self.reload_requested and stamp == self._overrides_stamp:
+            return
+        self.reload_requested = False
+        self._overrides_stamp = stamp
+        try:
+            self.reload(self.config_path)
+        except Exception:
+            log.exception("reload failed")
 
     # -- one cycle ----------------------------------------------------------------
 
@@ -265,7 +324,9 @@ class Controller:
                 load = self.emas[(zid, zone.load_input)].update(readings[zone.load_input].value)
             target = max(target, zone_duty(zone.temperature_curve, temp, zone.load_curve, load))
         self.notes[header.id] = [LOAD_WARMING_UP] if warming else []
-        shaped = self.shapers[header.id].apply(target, dt)
+        # The floor goes in before the shaper so that lowering it ramps down at the normal
+        # rate instead of dropping in one step, and raising it still takes effect at once.
+        shaped = self.shapers[header.id].apply(max(target, header.min_duty), dt)
         return apply_floor(shaped, header.min_duty)
 
     def _failsafe_header(self, header: Header) -> None:
@@ -302,6 +363,7 @@ class Controller:
 
     def cycle(self) -> dict:
         """Run one cycle; never raises. Returns the status document."""
+        self._poll_reload()
         now = self.clock()
         readings: dict[str, Reading] = {}
         rpms: dict[str, float | None] = {}
@@ -369,6 +431,8 @@ class Controller:
             "timestamp": now,
             "mode": self.config.mode,
             "config_valid": self.config_valid,
+            "overrides_applied": self.overrides_applied,
+            "overrides_error": self.overrides_error,
             "zones": {
                 z.id: {
                     "temperature": val(z.temperature_input),
@@ -384,6 +448,7 @@ class Controller:
                 h.id: {
                     "state": self.safety[h.id].state,
                     "mapped": h.mapped,
+                    "min_duty": h.min_duty,
                     "duty": self.duty.get(h.id),
                     "rpm": _finite(rpms.get(h.id)),
                     "reasons": list(self.safety[h.id].reasons),

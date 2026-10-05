@@ -76,7 +76,9 @@ config. Unmapped headers stay in firmware control.
 The service writes `/run/thermalctl/status.json` atomically every cycle: version, state
 per header, duty, RPM, zone inputs, active curve, fail-safe reasons, last change. hostwatch
 reads that file read-only as a source and raises alerts for fail-safe, stall and over
-temperature. hostwatch does not set targets.
+temperature. hostwatch does not set targets. The document also carries `overrides_applied`
+(whether an overrides file is part of the effective config), `overrides_error` (null or the
+reason the last overrides reload was rejected) and the effective `min_duty` per header.
 
 ## Chip names
 
@@ -128,8 +130,20 @@ never rewritten. Only `mode` and `[headers.<id>] min_duty` are allowed. A floor 
 0 to 100, at or above the header's `min_duty_limit`, and for a mapped header that exists;
 `mode = "active"` needs every header mapped. Any violation raises `ConfigError`. On POSIX
 a file not owned by root or writable by group or others is ignored with an error, not
-applied. A missing file is no overrides. `Controller.reload` merges the same file, and a
-mode change is still refused until restart. `check-config` prints the effective values.
+applied. A missing file is no overrides. `check-config` prints the effective values.
+
+`Controller.reload` merges the same file over the reloaded main config. When the
+controller is given a `config_path`, `cycle()` first checks for a reload: one is run when
+`request_reload()` was called (the service wires it to `SIGHUP`; the handler only sets a
+flag) or when the overrides file's (mtime, size) fingerprint changed, including appearing
+or disappearing. An overrides `ConfigError` is not a main config error: the previous
+effective config stays in force, no header enters failsafe, and the message is kept in
+`overrides_error`. A reload whose merged mode differs from the running mode while an
+overrides mode is involved is refused the same way, so a mode change from the overrides
+file needs a restart, which builds the controller from the merged config. A file ignored
+for ownership or permissions is reported in `overrides_error` too and the main floors
+apply. The header floor is applied before the output shaper, so lowering a floor ramps
+down at the normal rate and raising it takes effect in the same cycle.
 
 `thermalctl/curves.py` interpolates linearly between points and clamps at both ends.
 The zone duty is the larger of the temperature and load curve values. `docs/example.toml`

@@ -88,7 +88,16 @@ is `mode = "active"` while any header is unmapped. A rejected file is a config e
 `run` exits 1 and leaves the fans under firmware control. On POSIX the file must be owned
 by root and not writable by its group or others; otherwise it is ignored and an error is
 printed. A missing file means no overrides. `check-config` prints whether overrides were
-applied and the effective `min_duty` of every header. A mode change still needs a restart.
+applied and the effective `min_duty` of every header.
+
+The running service re-reads the overrides file, and the main config, on `SIGHUP` and
+whenever the overrides file's modification time or size changes or the file appears or
+disappears, at the start of the next cycle. A new `min_duty` applies at once: a higher
+floor takes effect immediately and a lower one ramps down at the normal rate. A mode change
+in the overrides file is refused while running and logged; restart the service to apply
+it. A rejected overrides file (bad value, unknown header, wrong owner) leaves the previous
+effective config in force, does not trigger fail-safe, and its reason is written to the
+status file as `overrides_error`, which clears when a good file is read.
 
 ## Header names and ownership
 
@@ -111,5 +120,5 @@ The service writes `/run/thermalctl/status.json` atomically every cycle. hostwat
 that file read-only and raises alerts for fail-safe, stall and over temperature; it never
 sets a target or writes to hardware. Point hostwatch at that path as a file source. The
 document holds the version, timestamp, mode, per-zone temperature and load, and per
-header state, duty, RPM and fail-safe reasons. `thermalctl status` shows the same data
+header state, duty, RPM, effective `min_duty` and fail-safe reasons, plus `overrides_applied` and `overrides_error` at the top level. `thermalctl status` shows the same data
 for a person at a shell.

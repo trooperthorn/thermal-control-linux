@@ -23,7 +23,7 @@ from .backends.sysfs import (
     install_signal_handlers,
     restore_from_state_file,
 )
-from .config import DEFAULT_OVERRIDES_PATH, Config, ConfigError, load_config, load_effective
+from .config import DEFAULT_OVERRIDES_PATH, Config, ConfigError, OverrideReport, load_config, load_effective
 from .controller import DEFAULT_STATUS_PATH, Controller
 from .hwmon import DEFAULT_HWMON_ROOT, HwmonError, resolve_config
 from .load import SUPPORTED_LOAD_INPUTS, LoadBackend
@@ -167,7 +167,7 @@ def run_service(
     try:
         return _serve(
             config, config_path, status_path, state_file, interval_s,
-            should_stop, sleep, notifier, proc_stat, hwmon_root, overrides_path,
+            should_stop, sleep, notifier, proc_stat, hwmon_root, overrides_path, report,
         )
     finally:
         lock.release()
@@ -185,6 +185,7 @@ def _serve(
     proc_stat: str,
     hwmon_root: str,
     overrides_path: str,
+    report: OverrideReport | None = None,
 ) -> int:
     if config.mode != "active":
         log.info("mode is dry_run: computing and logging only, no hardware writes")
@@ -201,8 +202,12 @@ def _serve(
             controller = Controller(
                 config, backend, status_path=status_path,
                 config_transform=lambda c: resolve_config(c, hwmon_root),
-                overrides_path=overrides_path,
+                overrides_path=overrides_path, config_path=config_path,
+                overrides_report=report,
             )
+            if hasattr(signal, "SIGHUP"):
+                # Reload overrides and config at the next cycle; the handler only sets a flag.
+                signal.signal(signal.SIGHUP, lambda signum, frame: controller.request_reload())
             notifier.ready()
             try:
                 controller.run(interval_s, should_stop, sleep=tick)
