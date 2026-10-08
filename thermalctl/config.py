@@ -10,7 +10,9 @@ import dataclasses
 import math
 import os
 import re
+import time
 import tomllib
+from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -272,6 +274,15 @@ class OverrideReport:
     ignored: str | None = None
     mode: str | None = None
     min_duty: dict[str, float] = field(default_factory=dict)
+    # Wall clock epoch seconds at which the file stops applying; None for no expiry.
+    expires_at: float | None = None
+    # True when the file was valid but its expires_at has passed, so the base config is used.
+    expired: bool = False
+
+    @property
+    def active(self) -> bool:
+        """True when the file is applied and changes something."""
+        return self.applied and (self.mode is not None or bool(self.min_duty))
 
 
 def _posix() -> bool:
@@ -291,13 +302,32 @@ def _insecure_reason(st: os.stat_result) -> str | None:
     return None
 
 
-def _parse_overrides(data: dict, config: Config) -> tuple[str | None, dict[str, float]]:
-    unknown = sorted(set(data) - {"mode", "headers"})
+def _expires_at(value: object) -> float:
+    """An expiry as epoch seconds: a TOML datetime with an offset, or a number."""
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            raise ConfigError("overrides: expires_at needs a time zone offset, for example Z")
+        return value.timestamp()
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError("overrides: expires_at must be a datetime with an offset or epoch seconds")
+    if not math.isfinite(value) or value <= 0:
+        raise ConfigError("overrides: expires_at must be a positive, finite time")
+    return float(value)
+
+
+def _parse_overrides(
+    data: dict, config: Config
+) -> tuple[str | None, dict[str, float], float | None]:
+    unknown = sorted(set(data) - {"mode", "headers", "expires_at"})
     if unknown:
         raise ConfigError(f"overrides: key {unknown[0]!r} is not allowed")
     mode = data.get("mode")
     if mode is not None and mode not in MODES:
         raise ConfigError(f"overrides: mode must be one of {', '.join(MODES)}")
+    expires_at = _expires_at(data["expires_at"]) if "expires_at" in data else None
+    if expires_at is not None and mode is not None:
+        # A mode change needs a restart, so the service could not revert it at expiry.
+        raise ConfigError("overrides: a mode cannot be time-bounded; remove expires_at or mode")
     raw = data.get("headers", {})
     if not isinstance(raw, dict):
         raise ConfigError("overrides: headers must be a table of header tables")
@@ -331,17 +361,19 @@ def _parse_overrides(data: dict, config: Config) -> tuple[str | None, dict[str, 
                 "overrides: mode active needs every header mapped; unmapped: "
                 + ", ".join(unmapped)
             )
-    return mode, floors
+    return mode, floors, expires_at
 
 
 def apply_overrides(
-    config: Config, overrides_path: str | Path | None
+    config: Config, overrides_path: str | Path | None, now: float | None = None
 ) -> tuple[Config, OverrideReport]:
     """Merge the optional overrides file over a validated config.
 
     A missing file means no overrides. A file that is not root-owned or is group or world
     writable (checked on POSIX only) is ignored. Any other problem is a ConfigError.
-    The main config file is never rewritten.
+    The main config file is never rewritten. A file whose expires_at is not after `now`
+    (wall clock epoch seconds, default the current time) is valid but no longer applies:
+    the base config is returned and the report has expired set.
     """
     path = str(overrides_path or DEFAULT_OVERRIDES_PATH)
     try:
@@ -361,17 +393,21 @@ def apply_overrides(
         raise ConfigError(f"cannot read overrides: {exc}") from exc
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"overrides are not valid TOML: {exc}") from exc
-    mode, floors = _parse_overrides(data, config)
+    mode, floors, expires_at = _parse_overrides(data, config)
+    if expires_at is not None and (time.time() if now is None else now) >= expires_at:
+        return config, OverrideReport(path, expires_at=expires_at, expired=True)
     headers = tuple(
         dataclasses.replace(h, min_duty=floors[h.id]) if h.id in floors else h
         for h in config.headers
     )
     merged = Config(mode=mode or config.mode, zones=config.zones, headers=headers)
-    return merged, OverrideReport(path, applied=True, mode=mode, min_duty=floors)
+    return merged, OverrideReport(
+        path, applied=True, mode=mode, min_duty=floors, expires_at=expires_at
+    )
 
 
 def load_effective(
-    path: str | Path, overrides_path: str | Path | None = None
+    path: str | Path, overrides_path: str | Path | None = None, now: float | None = None
 ) -> tuple[Config, OverrideReport]:
     """Load the main config and merge the overrides file over it."""
-    return apply_overrides(load_config(path), overrides_path)
+    return apply_overrides(load_config(path), overrides_path, now)

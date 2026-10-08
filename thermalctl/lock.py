@@ -51,6 +51,14 @@ class OwnerLock:
             handle.close()
             raise LockHeld(f"{self.path} is held by another process") from exc
         self._handle = handle
+        # Record the holder's pid so install-override can signal a reload. Best effort: the
+        # lock itself is what matters, and a file that cannot be written only costs the signal.
+        try:
+            handle.truncate(0)
+            handle.write(f"{os.getpid()}\n".encode("ascii"))
+            handle.flush()
+        except OSError:
+            pass
 
     def release(self) -> None:
         handle, self._handle = self._handle, None
@@ -71,6 +79,16 @@ class OwnerLock:
 
     def __exit__(self, *exc_info: object) -> None:
         self.release()
+
+
+def holder_pid(path: str | Path) -> int | None:
+    """The pid the lock holder recorded, or None when absent or unreadable."""
+    try:
+        text = Path(path).read_text(encoding="ascii").strip()
+        pid = int(text)
+    except (OSError, ValueError):
+        return None
+    return pid if pid > 0 else None
 
 
 def is_held(path: str | Path) -> bool:

@@ -99,7 +99,7 @@ def test_non_configerror_in_overrides_keeps_the_previous_config(tmp_path, monkey
     rig = Rig(tmp_path)
     rig.cycle()
 
-    def boom(config, path):
+    def boom(config, path, now=None):
         raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
 
     monkeypatch.setattr("thermalctl.controller.apply_overrides", boom)

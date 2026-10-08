@@ -61,7 +61,7 @@ class Rig:
         put(self.main, main_text)
         if overrides_text is not None:
             put(self.over, overrides_text)
-        config, report = load_effective(self.main, self.over)
+        config, report = load_effective(self.main, self.over, now=self.now)
         self.backend = FakeBackend()
         self.backend.rpms = {"pwm1": 900.0}
         self.ctl = Controller(

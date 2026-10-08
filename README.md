@@ -15,6 +15,8 @@ measured are listed in `UNVERIFIED.md`.
 - `thermalctl status` prints the status file the service writes: each zone's temperature and CPU load, then each header's state, duty, RPM and reasons. `--json` prints it raw.
   It exits non-zero when the file is missing or older than `--max-age` seconds.
 - `thermalctl check-config PATH` validates a config file and changes nothing. It rejects curves whose duty falls as the input rises and temperature curves that do not reach 100 percent at or below `hard_max_temp_c`.
+- `thermalctl install-override` reads a candidate overrides file from standard input, or from `--from PATH`, validates it exactly as the service will, and installs it. See the overrides section below.
+  It exits non-zero, and leaves the live file untouched, whenever the service would reject or ignore the candidate.
 - `thermalctl restore` refuses while the running service holds the ownership lock; `--force`
   skips that check and is what the unit uses after the service has exited. It reads the persisted original fan modes and puts them back. The
   systemd unit runs it as `ExecStopPost`, so it also runs after the service was killed.
@@ -97,6 +99,42 @@ by root and not writable by its group or others; otherwise it is ignored and an 
 printed. A missing file means no overrides. `check-config` prints whether overrides were
 applied and the effective `min_duty` of every header.
 
+An overrides file may also set a top-level `expires_at`, either a TOML datetime with an
+offset (`2026-10-08T06:00:00Z`) or epoch seconds. From that time the service ignores the
+file and runs on the base config again, with an audit line that names the override that
+ended; the file itself is left in place. `expires_at` cannot be combined with `mode`,
+because a mode change needs a restart and so could not be reverted on time. Floors may be
+fractions such as `min_duty = 22.5`. `thermalctl status` shows `override active` with its
+expiry, and the status file carries `override_active` and `override_expires_at` (wall
+clock epoch seconds, or `null`).
+
+`check-config` exits 1 when an overrides file is present but would not be applied, because
+it is ignored (not root-owned, or writable by its group or others) or because its
+`expires_at` has passed.
+
+### Installing an override
+
+    thermalctl install-override < candidate.toml
+    thermalctl install-override --from /path/to/candidate.toml
+
+The command loads the main config (`--config`, default `/etc/thermalctl/config.toml`),
+writes the candidate to a private temporary file beside the live file, sets it to root
+ownership and mode 0644, and runs the service's own `apply_overrides` on that copy. Only
+if the service would apply it does the command rename it over `/etc/thermalctl/overrides.toml`
+(`--overrides` changes the path), so the live file is replaced in one step and is never
+half written. It then sends `SIGHUP` to the pid the service records in its lock file, or
+reports that the service is not running. A rejected, ignored, expired or oversized
+(over 64 KiB) candidate, or a run that is not root, exits 1 with the reason on standard
+error and changes nothing. To end an override early, install a candidate that restores the
+floors, or delete the file.
+
+The example rule in `packaging/sudoers.d/hostwatch-control` lets the `hostwatch-control`
+account run exactly `thermalctl install-override` as root and nothing else: no tee, mv, cp,
+rm, shell or editor, and no `--overrides`, `--config` or `--from`, because sudo matches the
+arguments exactly. The path in that rule must be owned by root and not writable by any
+other user, along with every directory above it and the python the venv points to;
+otherwise whoever can change them can run code as root through this rule.
+
 The running service re-reads the overrides file, and the main config, on `SIGHUP` and
 whenever the overrides file's modification time or size changes or the file appears or
 disappears, at the start of the next cycle. A new `min_duty` applies at once: a higher
@@ -136,5 +174,5 @@ The service writes `/run/thermalctl/status.json` atomically every cycle. hostwat
 that file read-only and raises alerts for fail-safe, stall and over temperature; it never
 sets a target or writes to hardware. Point hostwatch at that path as a file source. The
 document holds the version, timestamp, mode, per-zone temperature and load, and per
-header state, duty, RPM, effective `min_duty` and fail-safe reasons, plus `overrides_applied` and `overrides_error` at the top level. The file is strict JSON, with `null` for any missing number, and its timestamps are wall clock time; the service's own timers use a monotonic clock, so a clock step cannot disable the stall or hold timers. `thermalctl status` shows the same data
+header state, duty, RPM, effective `min_duty` and fail-safe reasons, plus `overrides_applied`, `overrides_error`, `override_active` and `override_expires_at` at the top level. The file is strict JSON, with `null` for any missing number, and its timestamps are wall clock time; the service's own timers use a monotonic clock, so a clock step cannot disable the stall or hold timers. `thermalctl status` shows the same data
 for a person at a shell.

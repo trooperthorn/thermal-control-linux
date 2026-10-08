@@ -14,6 +14,7 @@ import signal
 import sys
 import time
 from collections.abc import Callable
+from datetime import datetime, timezone
 from pathlib import Path
 
 from . import __version__
@@ -31,10 +32,12 @@ from .config import (
 from .controller import DEFAULT_STATUS_PATH, Controller, remove_stale_status_temps
 from .hwmon import DEFAULT_HWMON_ROOT, HwmonError, resolve_config
 from .load import SUPPORTED_LOAD_INPUTS, LoadBackend
-from .lock import LockHeld, OwnerLock, default_lock_path, is_held
+from .install import InstallError, install_override, read_candidate, signal_service
+from .lock import LockHeld, OwnerLock, default_lock_path, holder_pid, is_held
 from .mapping import plan_lines, run_mapping, run_stall_search, stall_plan_lines
 from .notify import Notifier
 
+DEFAULT_CONFIG_PATH = "/etc/thermalctl/config.toml"
 DEFAULT_STATE_FILE = "/run/thermalctl/state.json"
 DEFAULT_INTERVAL_S = 2.0
 # The cycle interval must be a finite number in this range. NaN passes a plain "greater than
@@ -92,6 +95,17 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument("path", metavar="PATH")
     check.add_argument("--overrides", default=DEFAULT_OVERRIDES_PATH, metavar="PATH",
                        help="optional root-owned overrides file merged over the config")
+
+    install = sub.add_parser(
+        "install-override",
+        help="validate an overrides file from stdin or --from and install it for the service",
+    )
+    install.add_argument("--from", dest="source", default="-", metavar="PATH",
+                         help="candidate file, or - for standard input (default)")
+    install.add_argument("--config", default=DEFAULT_CONFIG_PATH, metavar="PATH")
+    install.add_argument("--overrides", default=DEFAULT_OVERRIDES_PATH, metavar="PATH")
+    install.add_argument("--state-file", default=DEFAULT_STATE_FILE)
+    install.add_argument("--lock-file", default=None, help="ownership lock (default: beside the state file)")
 
     restore = sub.add_parser("restore", help="restore the persisted original fan modes")
     restore.add_argument("--state-file", default=DEFAULT_STATE_FILE)
@@ -192,6 +206,8 @@ def run_service(
         report = OverrideReport(str(overrides_path), ignored=reason)
     if report.ignored:
         _err(f"{report.path}: {report.ignored}")
+    elif report.expired:
+        _err(f"{report.path}: expires_at has passed, main config used")
     elif report.applied:
         log.info("overrides applied from %s", report.path)
     problems = validate_for_service(config)
@@ -310,6 +326,11 @@ def cmd_status(args: argparse.Namespace) -> int:
             load_text = "not used" if "load" not in zone or (load is None and zone.get("load_curve") is None) \
                 else ("unavailable" if load is None else f"{load:.0f} %")
             _out(f"  zone {zid}: temperature {temp_text}, load {load_text}")
+        if doc.get("override_active"):
+            expiry = doc.get("override_expires_at")
+            _out("  override active, " + (
+                "no expiry" if expiry is None else f"expires {_when(float(expiry))}"
+            ))
         for hid, header in sorted(doc.get("headers", {}).items()):
             reasons = ",".join(header.get("reasons", [])) or "none"
             _out(
@@ -338,16 +359,59 @@ def cmd_check_config(args: argparse.Namespace) -> int:
     _out(f"mapped headers: {', '.join(mapped) if mapped else 'none'}")
     if config.mode == "active" and not mapped:
         _out("note: active mode controls nothing until a header is mapped")
+    # An overrides file the service would not apply is a failed check, so a caller that
+    # installs one learns at once that it has no effect.
+    exit_code = 0
     if report.ignored:
         _err(f"{report.path}: {report.ignored}")
         _out("overrides: ignored")
+        exit_code = 1
+    elif report.expired:
+        _err(f"{report.path}: expires_at has passed, the base config applies")
+        _out("overrides: expired")
+        exit_code = 1
     elif report.applied:
         _out(f"overrides: applied from {report.path}")
+        if report.expires_at is not None:
+            _out(f"override expires at {_when(report.expires_at)}")
     else:
         _out(f"overrides: none ({report.path} not found)")
     for header in config.headers:
         note = " (overridden)" if header.id in report.min_duty else ""
         _out(f"effective {header.id}: min_duty {header.min_duty:g}{note}")
+    return exit_code
+
+
+def _when(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def cmd_install_override(args: argparse.Namespace) -> int:
+    logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
+    try:
+        if args.source == "-":
+            candidate = read_candidate(getattr(sys.stdin, "buffer", sys.stdin))
+        else:
+            with open(args.source, "rb") as handle:
+                candidate = read_candidate(handle)
+        report = install_override(
+            candidate, args.config, args.overrides, validate_extra=validate_for_service,
+        )
+    except (InstallError, OSError) as exc:
+        _err(f"override not installed, the live file is unchanged: {exc}")
+        return 1
+    expiry = "no expiry" if report.expires_at is None else f"expires {_when(report.expires_at)}"
+    _out(f"override installed to {report.path}: {expiry}")
+    lock_path = args.lock_file or default_lock_path(args.state_file)
+    pid = holder_pid(lock_path)
+    if pid is not None and is_held(lock_path):
+        try:
+            signal_service(pid)
+            _out(f"service {pid} signalled to reload")
+        except (OSError, AttributeError) as exc:
+            _out(f"could not signal the service ({exc}); it re-reads the file on its next cycle")
+    else:
+        _out("service is not running; the file applies at its next start")
     return 0
 
 
@@ -471,6 +535,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_status(args)
     if args.command == "check-config":
         return cmd_check_config(args)
+    if args.command == "install-override":
+        return cmd_install_override(args)
     if args.command == "restore":
         return cmd_restore(args)
     return cmd_map_headers(args)

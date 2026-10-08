@@ -207,6 +207,11 @@ class Controller:
         self.overrides_mode = report.mode
         # Why the last overrides reload was rejected or ignored; None when all is well.
         self.overrides_error: str | None = report.ignored
+        # The active override and when it ends, in wall clock epoch seconds. The expiry is an
+        # absolute time, so it is compared with the wall clock, not the monotonic timer clock.
+        self._expiry_tried: float | None = None
+        self.override_active = report.active
+        self.override_expires_at: float | None = report.expires_at if report.applied else None
         self._stamps = self._stat_files()
         self.config_valid = True
         self.config = config
@@ -220,6 +225,12 @@ class Controller:
         self._build(config)
         for line in describe_changes(None, config):
             audit.info("config loaded: %s", line)
+        if report.expired:
+            audit.warning(
+                "override expired at %s before start: base config in use", report.expires_at
+            )
+        elif report.active:
+            audit.warning("override active, expires_at=%s", report.expires_at)
 
     # -- configuration -------------------------------------------------------------
 
@@ -307,12 +318,14 @@ class Controller:
                 problems.append(f"header {header.id} path {before.path}->{header.path}")
         return problems
 
-    def reload(self, path: str | Path) -> bool:
+    def reload(self, path: str | Path, *, use_overrides: bool = True) -> bool:
         """Load a config file. An invalid file keeps failsafe and the old config unused.
 
         A change that needs a restart (dry run to active, or a newly mapped header or a
         changed mapped path) is refused: the old config stays in force and nothing else
-        changes. Stopping control of a header is always allowed.
+        changes. Stopping control of a header is always allowed. With use_overrides false the
+        overrides file is skipped, which reverts an expired override even when its file can
+        no longer be read.
         """
         try:
             new = load_config(path)
@@ -329,7 +342,10 @@ class Controller:
         # A bad overrides file is not a bad config: the previous effective config stays in
         # force, nothing goes to failsafe, and the reason is published in the status file.
         try:
-            new, report = apply_overrides(new, self.overrides_path)
+            if use_overrides:
+                new, report = apply_overrides(new, self.overrides_path, self.wall_clock())
+            else:
+                report = OverrideReport(str(self.overrides_path or DEFAULT_OVERRIDES_PATH))
         except Exception as exc:
             self.overrides_error = str(exc) if isinstance(exc, ConfigError) else (
                 f"{type(exc).__name__}: {exc}"
@@ -362,6 +378,13 @@ class Controller:
         self.overrides_applied = report.applied
         self.overrides_mode = report.mode
         self.overrides_error = report.ignored
+        if self.override_active and not report.active:
+            audit.warning(
+                "override ended (expires_at=%s expired=%s): base config in use",
+                self.override_expires_at, report.expired or not use_overrides,
+            )
+        self.override_active = report.active
+        self.override_expires_at = report.expires_at if report.applied else None
         return True
 
     def _stat_files(self) -> tuple[tuple[int, int] | None, tuple[int, int] | None]:
@@ -383,7 +406,8 @@ class Controller:
         if self.config_path is None:
             return
         stamps = self._stat_files()
-        if not self.reload_requested and stamps == self._stamps:
+        expired = self._override_expired()
+        if not self.reload_requested and not expired and stamps == self._stamps:
             return
         self.reload_requested = False
         self._stamps = stamps
@@ -391,6 +415,23 @@ class Controller:
             self.reload(self.config_path)
         except Exception:
             log.exception("reload failed")
+        if self._override_expired():
+            # Try the forced revert once per expiry; a refusal repeats every cycle otherwise.
+            self._expiry_tried = self.override_expires_at
+            # The reload could not retire the override (the file is unreadable, or the main
+            # config was refused). The floor must not stay lowered past its end, so drop the
+            # overrides file from the effective config altogether.
+            try:
+                self.reload(self.config_path, use_overrides=False)
+            except Exception:
+                log.exception("override expiry revert failed")
+
+    def _override_expired(self) -> bool:
+        return (
+            self.override_expires_at is not None
+            and self.override_expires_at != self._expiry_tried
+            and self.wall_clock() >= self.override_expires_at
+        )
 
     # -- one cycle ----------------------------------------------------------------
 
@@ -589,6 +630,8 @@ class Controller:
             "config_valid": self.config_valid,
             "overrides_applied": self.overrides_applied,
             "overrides_error": self.overrides_error,
+            "override_active": self.override_active,
+            "override_expires_at": self.override_expires_at,
             "config_error": self.config_error,
             "zones": {
                 z.id: {

@@ -1,0 +1,16 @@
+# Example sudoers rule for the thermalctl override command. Install it as
+# /etc/sudoers.d/hostwatch-control with mode 0440, owned by root, and check it with
+# visudo -cf before relying on it.
+#
+# hostwatch-control may run exactly one command as root: thermalctl install-override.
+# That command validates a candidate overrides file, replaces /etc/thermalctl/overrides.toml
+# atomically with root ownership and mode 0644, and signals the service. The account gets
+# no generic tee, mv, cp, rm, sh or editor, so it cannot write any other file as root.
+#
+# A command written with arguments matches only those exact arguments, so this rule does
+# not allow --overrides, --config or --from. The candidate is read from standard input.
+#
+# The path below must be root-owned and not writable by any other user, and so must every
+# directory above it, including the venv's bin directory and the interpreter it points to.
+# If the account could replace that file or the python it runs, this rule would hand it root.
+hostwatch-control ALL=(root) NOPASSWD: /opt/thermalctl/venv/bin/thermalctl install-override

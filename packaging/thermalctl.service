@@ -20,6 +20,19 @@ RuntimeDirectory=thermalctl
 RuntimeDirectoryPreserve=yes
 TimeoutStopSec=20
 User=root
+# Hardening that leaves the sysfs pwm and pwm_enable writes alone. Deliberately absent:
+# ProtectKernelTunables, PrivateDevices and ProtectSystem=strict, any of which can make /sys
+# read-only or hide it from the service, which would stop it writing fan duty. The service
+# only reads /etc, writes under /run/thermalctl, and talks to systemd over a unix socket.
+# UNVERIFIED.md lists these settings until they are tested on the target hosts.
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
 
 [Install]
 WantedBy=multi-user.target

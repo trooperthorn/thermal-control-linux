@@ -201,7 +201,7 @@ def test_check_config_rejects_bad_override(tmp_path, capsys, trusted):
     assert "below the allowed minimum" in capsys.readouterr().err
 
 
-def test_check_config_reports_ignored_overrides(tmp_path, capsys, monkeypatch):
+def test_check_config_exits_non_zero_when_overrides_are_ignored(tmp_path, capsys, monkeypatch):
     main_path = write_main(tmp_path)
     over = overrides(tmp_path, "[headers.pwm2]\nmin_duty = 20\n")
     monkeypatch.setattr(config_module, "_posix", lambda: True)
@@ -209,7 +209,9 @@ def test_check_config_reports_ignored_overrides(tmp_path, capsys, monkeypatch):
         config_module, "_stat_file",
         lambda p: SimpleNamespace(st_uid=1000, st_mode=stat.S_IFREG | 0o600),
     )
-    assert main(["check-config", str(main_path), "--overrides", str(over)]) == 0
+    # Regression: an ignored overrides file used to exit 0, so a caller could not tell that
+    # its override had no effect.
+    assert main(["check-config", str(main_path), "--overrides", str(over)]) == 1
     captured = capsys.readouterr()
     assert "overrides: ignored" in captured.out
     assert "effective pwm2: min_duty 30" in captured.out
