@@ -152,7 +152,7 @@ def test_install_refuses_when_the_main_config_is_invalid(host, capsys, monkeypat
 
 def test_install_signals_the_running_service(host, capsys, monkeypatch):
     lock = host.dir / "thermalctl.lock"
-    put(lock, "4242\n")
+    put(lock, "service 4242\n")
     sent = []
     monkeypatch.setattr("thermalctl.cli.signal_service", sent.append)
     monkeypatch.setattr("thermalctl.cli.is_held", lambda path: True)
@@ -179,10 +179,88 @@ def test_lock_records_the_holder_pid(tmp_path):
     from thermalctl.lock import OwnerLock, holder_pid
 
     path = tmp_path / "x.lock"
-    with OwnerLock(path):
+    lock = OwnerLock(path)
+    lock.acquire(role="service")
+    try:
         if install_module.os.name == "posix":
             assert holder_pid(path) == install_module.os.getpid()
+    finally:
+        lock.release()
     assert holder_pid(tmp_path / "missing.lock") is None
+
+
+def test_only_the_service_is_ever_signalled_not_a_mapping_holder(tmp_path):
+    from thermalctl.lock import OwnerLock, holder_pid, is_held
+
+    path = tmp_path / "x.lock"
+    # A stale pid left by an earlier service run.
+    put(path, "service 4242\n")
+    mapper = OwnerLock(path)
+    mapper.acquire()  # the role map-headers uses
+    try:
+        # SIGHUP would end a mapping run without restoring the fans, so no pid is offered.
+        assert holder_pid(path) is None
+    finally:
+        mapper.release()
+
+
+def test_install_does_not_signal_a_mapping_holder(host, capsys, monkeypatch):
+    lock = host.dir / "thermalctl.lock"
+    put(lock, "service 4242\n")  # stale pid from an earlier service run
+    sent = []
+    monkeypatch.setattr("thermalctl.cli.signal_service", sent.append)
+    monkeypatch.setattr("thermalctl.cli.is_held", lambda path: True)
+    from thermalctl.lock import OwnerLock
+
+    mapper = OwnerLock(lock)
+    mapper.acquire()
+    try:
+        code, out = run_install(host, LIVE, capsys, monkeypatch, "--lock-file", str(lock))
+    finally:
+        mapper.release()
+    assert code == 0 and sent == []
+
+
+def test_probing_a_free_lock_leaves_the_file_alone(tmp_path):
+    from thermalctl.lock import is_held
+
+    path = tmp_path / "x.lock"
+    put(path, "service 4242\n")
+    assert is_held(path) is False
+    assert path.read_text(encoding="ascii") == "service 4242\n"
+
+
+def test_install_refuses_a_mode_change_the_running_service_would_refuse(
+    host, capsys, monkeypatch
+):
+    status = host.dir / "status.json"
+    put(status, json.dumps({"mode": "dry_run"}))
+    monkeypatch.setattr("thermalctl.cli.is_held", lambda path: True)
+    before = host.live.read_bytes()
+    code, out = run_install(
+        host, 'mode = "active"\n[headers.pwm1]\nmin_duty = 22\n', capsys, monkeypatch,
+        "--status-path", str(status),
+    )
+    assert code == 1 and "needs a restart" in out.err
+    assert host.live.read_bytes() == before and leftovers(host) == []
+    # The same mode as the running service is accepted.
+    put(status, json.dumps({"mode": "active"}))
+    code, out = run_install(
+        host, 'mode = "active"\n[headers.pwm1]\nmin_duty = 22\n', capsys, monkeypatch,
+        "--status-path", str(status),
+    )
+    assert code == 0, out.err
+
+
+def test_install_refuses_a_mode_change_when_the_running_mode_is_unknown(
+    host, capsys, monkeypatch
+):
+    monkeypatch.setattr("thermalctl.cli.is_held", lambda path: True)
+    code, out = run_install(
+        host, 'mode = "active"\n', capsys, monkeypatch,
+        "--status-path", str(host.dir / "missing.json"),
+    )
+    assert code == 1 and "unknown" in out.err
 
 
 # -- check-config exit code -----------------------------------------------------------
@@ -269,6 +347,26 @@ def test_expiry_reverts_even_when_the_overrides_file_can_no_longer_be_merged(
     assert doc["headers"]["pwm1"]["min_duty"] == 40
     assert doc["override_active"] is False
     assert any("override ended" in r.getMessage() for r in caplog.records)
+
+
+def test_expiry_reverts_when_the_main_config_needs_a_restart(tmp_path, caplog):
+    rig = Rig(tmp_path, "expires_at = 1010\n[headers.pwm1]\nmin_duty = 20\n")
+    rig.cycle()
+    # An edit the running backend cannot follow: both the normal and the forced reload
+    # are refused for it, yet the lowered floor must still end at expires_at.
+    put(rig.main, MAIN.replace("/fake/pwm1", "/fake/pwm9"))
+    with caplog.at_level(logging.INFO, logger="thermalctl.audit"):
+        doc = rig.cycle(advance=20.0)
+    assert doc["override_active"] is False and doc["override_expires_at"] is None
+    assert doc["headers"]["pwm1"]["min_duty"] == 40
+    assert doc["config_error"] and "restart required" in doc["config_error"]
+    assert any("override ended" in r.getMessage() for r in caplog.records)
+    # Later cycles keep the base floor and do not repeat the audit line.
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="thermalctl.audit"):
+        doc = rig.cycle()
+    assert doc["headers"]["pwm1"]["min_duty"] == 40
+    assert not [r for r in caplog.records if "override ended" in r.getMessage()]
 
 
 def test_expired_override_at_start_uses_the_base_config(tmp_path, caplog):

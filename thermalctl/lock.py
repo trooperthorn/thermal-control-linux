@@ -18,6 +18,7 @@ else:  # pragma: no cover - exercised only on Windows development hosts
     import msvcrt
 
 LOCK_NAME = "thermalctl.lock"
+SERVICE_TAG = "service"
 
 
 class LockHeld(Exception):
@@ -34,8 +35,13 @@ class OwnerLock:
         self.path = Path(path)
         self._handle = None
 
-    def acquire(self, *, create_dir: bool = False) -> None:
-        """Take the lock without waiting; raise LockHeld when another holder has it."""
+    def acquire(self, *, create_dir: bool = False, role: str | None = "other") -> None:
+        """Take the lock without waiting; raise LockHeld when another holder has it.
+
+        role "service" records this pid in the file so install-override can signal it. Any
+        other role clears the file, so a pid left by an earlier service is never mistaken for
+        a live one. role None (a probe) leaves the file untouched.
+        """
         if self._handle is not None:
             return
         if create_dir:
@@ -51,11 +57,14 @@ class OwnerLock:
             handle.close()
             raise LockHeld(f"{self.path} is held by another process") from exc
         self._handle = handle
-        # Record the holder's pid so install-override can signal a reload. Best effort: the
-        # lock itself is what matters, and a file that cannot be written only costs the signal.
+        if role is None:
+            return
+        # Best effort: the lock itself is what matters, and a file that cannot be written
+        # only costs the reload signal.
         try:
             handle.truncate(0)
-            handle.write(f"{os.getpid()}\n".encode("ascii"))
+            if role == "service":
+                handle.write(f"{SERVICE_TAG} {os.getpid()}\n".encode("ascii"))
             handle.flush()
         except OSError:
             pass
@@ -82,13 +91,17 @@ class OwnerLock:
 
 
 def holder_pid(path: str | Path) -> int | None:
-    """The pid the lock holder recorded, or None when absent or unreadable."""
+    """The pid of the service holding the lock, or None when absent, unreadable or not a service.
+
+    Only a holder that tagged itself as the service is returned: other holders (the mapping
+    test) do not handle SIGHUP and would be ended by it.
+    """
     try:
-        text = Path(path).read_text(encoding="ascii").strip()
+        tag, _, text = Path(path).read_text(encoding="ascii").strip().partition(" ")
         pid = int(text)
     except (OSError, ValueError):
         return None
-    return pid if pid > 0 else None
+    return pid if tag == SERVICE_TAG and pid > 0 else None
 
 
 def is_held(path: str | Path) -> bool:
@@ -97,7 +110,7 @@ def is_held(path: str | Path) -> bool:
         return False
     probe = OwnerLock(path)
     try:
-        probe.acquire()
+        probe.acquire(role=None)
     except LockHeld:
         return True
     probe.release()

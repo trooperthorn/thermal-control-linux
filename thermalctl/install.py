@@ -63,6 +63,8 @@ def install_override(
     now: float | None = None,
     chown: Callable[[str | Path], None] | None = None,
     validate_extra: Callable[[Config], list[str]] | None = None,
+    service_running: bool = False,
+    running_mode: str | None = None,
 ) -> OverrideReport:
     """Validate and install; return the report of the installed file or raise InstallError."""
     target = Path(overrides_path)
@@ -99,6 +101,16 @@ def install_override(
             problems = validate_extra(merged)
             if problems:
                 raise InstallError("the service would refuse to start: " + "; ".join(problems))
+        # A running service refuses an override that changes its mode (changing mode needs a
+        # restart), so installing one would be accepted here and then ignored on reload.
+        if service_running and report.mode is not None and report.mode != running_mode:
+            known = f"the service runs in {running_mode}" if running_mode else (
+                "the service's running mode is unknown"
+            )
+            raise InstallError(
+                f"the service would refuse this file: mode {report.mode} from overrides needs "
+                f"a restart, and {known}"
+            )
         os.replace(tmp, target)
     except BaseException:
         try:

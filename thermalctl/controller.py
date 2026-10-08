@@ -169,6 +169,7 @@ class Controller:
         overrides_path: str | Path | None = None,
         config_path: str | Path | None = None,
         overrides_report: OverrideReport | None = None,
+        base_config: Config | None = None,
     ) -> None:
         self.backend = backend
         # Headers whose failsafe write failed and was already audited; cleared on success.
@@ -215,6 +216,15 @@ class Controller:
         self._stamps = self._stat_files()
         self.config_valid = True
         self.config = config
+        # The running config without the overrides merged in. An expired override is retired
+        # by going back to this, so the revert never depends on the main config on disk being
+        # acceptable to a reload (it may hold a change that needs a restart).
+        self._base_config: Config | None = base_config
+        if self._base_config is None:
+            if not report.applied:
+                self._base_config = config
+            elif config_path is not None:
+                self._base_config = self._load_base(config_path)
         self.safety: dict[str, HeaderSafety] = {}
         self.shapers: dict[str, OutputShaper] = {}
         self.emas: dict[tuple[str, str], Ema] = {}
@@ -287,6 +297,44 @@ class Controller:
             if header.id in self.shapers:
                 self.shapers[header.id].reset(100.0)
 
+    def _load_base(self, path: str | Path) -> Config | None:
+        """The main config as a reload would see it, without overrides; None when unusable."""
+        try:
+            base = load_config(path)
+            return self.config_transform(base) if self.config_transform is not None else base
+        except Exception:
+            log.exception("cannot load the base config")
+            return None
+
+    def _revert_override_in_place(self) -> bool:
+        """Drop an expired override by returning to the running base config.
+
+        Used when a reload could not retire the override, for example because the edited
+        main config needs a restart and so is refused. The lowered floors must not outlast
+        expires_at, so this does not consult the main config file when the base is known.
+        """
+        base = self._base_config
+        if base is None and self.config_path is not None:
+            base = self._load_base(self.config_path)
+        if base is None:
+            audit.error("override expired but the base config is unknown, floors stay lowered")
+            return False
+        audit.warning(
+            "override ended (expires_at=%s expired=True): base config in use",
+            self.override_expires_at,
+        )
+        for line in describe_changes(self.config, base):
+            audit.warning("config change: %s", line)
+        if base != self.config:
+            self._release_dropped(self.config, base)
+            self.config = base
+            self._build(base)
+        self.override_active = False
+        self.override_expires_at = None
+        self.overrides_applied = False
+        self.overrides_mode = None
+        return True
+
     def _restart_required(self, old: Config, new: Config) -> list[str]:
         """Changes the running backend cannot follow, which need a restart.
 
@@ -339,6 +387,7 @@ class Controller:
             audit.error("config reload rejected, failsafe stays in force: %s", self.config_error)
             self.config_valid = False
             return False
+        base = new
         # A bad overrides file is not a bad config: the previous effective config stays in
         # force, nothing goes to failsafe, and the reason is published in the status file.
         try:
@@ -375,6 +424,7 @@ class Controller:
             self._build(new)
         self.config_valid = True
         self.config_error = None
+        self._base_config = base
         self.overrides_applied = report.applied
         self.overrides_mode = report.mode
         self.overrides_error = report.ignored
@@ -425,6 +475,16 @@ class Controller:
                 self.reload(self.config_path, use_overrides=False)
             except Exception:
                 log.exception("override expiry revert failed")
+            # The main config may itself be refused (a change that needs a restart), which
+            # blocks both reloads above. Then go back to the running base config directly.
+            if self.override_active and self.override_expires_at is not None:
+                try:
+                    done = self._revert_override_in_place()
+                except Exception:
+                    log.exception("in-place override revert failed")
+                    done = False
+                if not done:
+                    self._expiry_tried = None
 
     def _override_expired(self) -> bool:
         return (

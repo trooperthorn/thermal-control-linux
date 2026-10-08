@@ -105,6 +105,7 @@ def build_parser() -> argparse.ArgumentParser:
     install.add_argument("--config", default=DEFAULT_CONFIG_PATH, metavar="PATH")
     install.add_argument("--overrides", default=DEFAULT_OVERRIDES_PATH, metavar="PATH")
     install.add_argument("--state-file", default=DEFAULT_STATE_FILE)
+    install.add_argument("--status-path", default=DEFAULT_STATUS_PATH, metavar="PATH")
     install.add_argument("--lock-file", default=None, help="ownership lock (default: beside the state file)")
 
     restore = sub.add_parser("restore", help="restore the persisted original fan modes")
@@ -223,7 +224,7 @@ def run_service(
         return 1
     lock = OwnerLock(lock_file or default_lock_path(state_file))
     try:
-        lock.acquire(create_dir=True)
+        lock.acquire(create_dir=True, role="service")
     except (LockHeld, OSError) as exc:
         _err(f"cannot take the ownership lock: {exc}")
         return 1
@@ -386,8 +387,21 @@ def _when(epoch: float) -> str:
     return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _running_mode(status_path: str) -> str | None:
+    """The mode the running service reports in its status file; None when unknown."""
+    try:
+        with open(status_path, encoding="utf-8") as handle:
+            mode = json.load(handle).get("mode")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return mode if mode in ("active", "dry_run") else None
+
+
 def cmd_install_override(args: argparse.Namespace) -> int:
     logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
+    lock_path = args.lock_file or default_lock_path(args.state_file)
+    running = is_held(lock_path)
+    running_mode = _running_mode(args.status_path) if running else None
     try:
         if args.source == "-":
             candidate = read_candidate(getattr(sys.stdin, "buffer", sys.stdin))
@@ -396,13 +410,13 @@ def cmd_install_override(args: argparse.Namespace) -> int:
                 candidate = read_candidate(handle)
         report = install_override(
             candidate, args.config, args.overrides, validate_extra=validate_for_service,
+            service_running=running, running_mode=running_mode,
         )
     except (InstallError, OSError) as exc:
         _err(f"override not installed, the live file is unchanged: {exc}")
         return 1
     expiry = "no expiry" if report.expires_at is None else f"expires {_when(report.expires_at)}"
     _out(f"override installed to {report.path}: {expiry}")
-    lock_path = args.lock_file or default_lock_path(args.state_file)
     pid = holder_pid(lock_path)
     if pid is not None and is_held(lock_path):
         try:
