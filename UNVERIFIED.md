@@ -54,6 +54,8 @@ The meaning of the pwmN_enable values (5 and 0 here) is still unverified; see be
 | The install path (venv, its bin directory and the interpreter it points to) is root-owned and not writable by `hostwatch-control` on MediaIn-SVR and TrueNAS-SVR | `namei -l /opt/thermalctl/venv/bin/thermalctl; namei -l $(readlink -f /opt/thermalctl/venv/bin/python)` |
 | Override expiry compares `expires_at` with the wall clock, so a clock stepped backwards (for example by an NTP correction) delays the revert by the size of the step, and a step forwards ends the override early | Install an override with a 2 minute `expires_at`, step the clock back 5 minutes with `timedatectl set-time` on a test host, and note when `override ended` is audited |
 | TrueNAS can run the unit (systemd) or needs a Post Init script instead | `systemctl --version` on TrueNAS-SVR |
+| Reading `pwmN` back returns the 0 to 255 value last written while `pwmN_enable` is 1 on the nct6775 driver, so the write-only-on-change check (`holds`) sees an external change and does not rewrite every cycle | Supervised test: set manual, write 128 to one header, `cat pwmN` and compare, then `echo 64 > pwmN` from a shell with the service running and watch the service put 128 back within one cycle |
+| Skipping repeated identical `pwmN` writes (rewritten every 60 cycles) does not let the chip or firmware drift the duty unseen between reads, and the two minute refresh suits the fans | Supervised test: run active on one header for an hour, log `pwmN` and `fanN_input` once a second and note any change not made by the service |
 
 
 ## Header mapping on MediaIn-SVR (measured 2026-10-03)

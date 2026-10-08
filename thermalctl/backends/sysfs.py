@@ -327,6 +327,19 @@ class SysfsBackend:
             return
         _write_int(self.headers[header_id], duty_to_pwm(duty))
 
+    def holds(self, header_id: str, duty: float) -> bool:
+        """True when pwmN still holds the value a write of duty would make.
+
+        One read. An unreadable or unparsable file counts as not holding, so the caller
+        writes again. A header this backend does not control has nothing to check.
+        """
+        if not self._controlled(header_id):
+            return True
+        try:
+            return int(_read_text(self.headers[header_id])) == duty_to_pwm(duty)
+        except (OSError, ValueError):
+            return False
+
     def owns(self, header_id: str) -> bool:
         """False when pwmN_enable no longer holds the value this backend last set.
 

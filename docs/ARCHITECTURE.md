@@ -65,7 +65,7 @@ check; the unit uses it for `ExecStopPost`, which runs after the service has exi
 
 The sysfs backend remembers the `pwmN_enable` value it last wrote for each header it
 controls (manual after start, the original after a release). Each cycle the controller
-asks `owns(header)` for every enabled header. If the file holds anything else, or cannot be
+asks `owns(header)` for every enabled header (one read, reused by the failsafe check). If the file holds anything else, or cannot be
 read, the header goes to failsafe with `external_change:<id>`, is driven to full speed,
 and leaves failsafe only after the value is back and the hold period has passed.
 
@@ -238,7 +238,7 @@ config belongs to the controller slice.
 ### Controller loop implementation
 
 `thermalctl/backend.py` defines the `Backend` interface (`read_inputs`, `read_rpm`,
-`write_duty`, `release`) and an in-memory `FakeBackend` for tests. The controller reaches
+`write_duty`, `release`, `owns`, `holds`, `retake`) and an in-memory `FakeBackend` for tests. The controller reaches
 hardware only through it.
 
 `thermalctl/controller.py` runs one cycle at a time. It reads inputs and RPMs, runs each
@@ -256,11 +256,34 @@ If the full speed write (or the manual mode write before it) fails for an enable
 the controller calls `release()` on that header at once, so the chip's own control takes
 over instead of the fan keeping its last low duty. The header reports duty 0, the note
 `failsafe_write_failed`, and an error line in the audit log, and the same attempt is made
-again on every cycle while the header stays in failsafe. Each attempt writes manual mode
+again on every cycle while the header stays in failsafe, because a failed write is never
+recorded as applied. Each attempt writes manual mode
 (retake), fails the 255 write, then writes the original mode (release), so a stuck header
 makes two `pwmN_enable` writes per cycle and is briefly in manual mode; the audit line is
 written once per episode, not once per cycle. If the recorded original is manual, release
 writes 255 first and falls back to mode 5 when that fails.
+
+Write economy. The controller records, per header, the register value it last wrote and
+the number of cycles since. A computed duty is written only when its 0 to 255 value
+differs from the recorded one. When it is the same, one `holds(header, duty)` read of
+`pwmN` confirms the register, and a mismatch (another program lowered it) is written
+again in the same cycle, so an external value change is corrected within one cycle. A
+write is also forced every `FORCE_REFRESH_CYCLES` (60, two minutes at the default 2
+second interval) to correct any drift a read cannot show; `Controller(refresh_cycles=)`
+sets it. In failsafe the controller writes manual mode and 255 (or releases to firmware)
+once. On the following cycles it only verifies: the ownership read and, for full speed,
+the `holds` read. A changed mode or value repeats the write at once, and the write also
+repeats at the forced refresh. Leaving failsafe takes the header back and writes the new
+duty once. Reloading a config, or dropping a header, clears the records so the next
+cycle writes afresh.
+
+The `pwmN_enable` ownership read stays at one per enabled header per cycle: it is the
+only way to see an external mode change within one cycle, so it is not thinned out. The
+failsafe verification reuses that same read instead of making a second one. Measured on
+the fake backend over 600 cycles of a steady 60 C with two headers: 600 writes per header
+before (30 a minute), 10 after (0.5 a minute), with about one verification read per
+header per cycle. A failsafe held for 20 cycles took 20 `pwmN_enable` writes and 20
+`pwmN` writes before and takes 1 and 1 after, plus 19 verification reads.
 
 Clocks. Every timer (the hold period, the stall, low RPM and slow fan windows, and the
 staleness check) and every reading timestamp runs on a monotonic clock, `time.monotonic`

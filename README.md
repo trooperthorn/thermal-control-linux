@@ -152,6 +152,15 @@ hwmonN number can change across boots. If the chip is missing it exits without t
 fan. The service holds a lock under `/run/thermalctl` while it runs, and it puts a header
 in fail-safe if something else changes that header's `pwmN_enable`.
 
+## Write economy
+
+The service writes a fan's `pwmN` only when the value changes, and checks it with one read
+each cycle otherwise. If another program changes the value or the `pwmN_enable` mode, the
+next cycle puts it back. Every 60 cycles (two minutes at the default interval) the value
+is written again whatever the read says. In fail-safe the service writes manual mode and
+full speed once and then verifies them by reading. This keeps the writes to the chip to
+about 0.5 a minute per header in steady state instead of 30.
+
 ## Stall and minimum RPM
 
 A fan commanded above 0 percent, including at its floor duty, that reads 0 RPM for longer

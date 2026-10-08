@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Protocol
 
+from .backends.sysfs import duty_to_pwm
 from .safety import Reading
 
 
@@ -28,6 +29,13 @@ class Backend(Protocol):
     def owns(self, header_id: str) -> bool:
         """False when something else changed the header's mode since this service set it."""
 
+    def holds(self, header_id: str, duty: float) -> bool:
+        """True when the header's duty register still holds the value a write of duty makes.
+
+        One read, no write. False when the value differs or cannot be read, so the caller
+        writes it again.
+        """
+
     def retake(self, header_id: str) -> None:
         """Write manual mode again, so the chip accepts duty writes after a foreign change."""
 
@@ -43,6 +51,10 @@ class FakeBackend:
         self.releases: list[str] = []
         self.retakes: list[str] = []
         self.foreign: set[str] = set()
+        # The raw 0 to 255 register value per header, as the last write left it. A test
+        # changes it directly to play another program rewriting the duty.
+        self.pwm: dict[str, int] = {}
+        self.holds_calls: list[str] = []
 
     def read_inputs(self) -> Mapping[str, Reading]:
         if self.fail_reads:
@@ -54,12 +66,17 @@ class FakeBackend:
 
     def write_duty(self, header_id: str, duty: float) -> None:
         self.writes.append((header_id, duty))
+        self.pwm[header_id] = duty_to_pwm(duty)
 
     def release(self, header_id: str) -> None:
         self.releases.append(header_id)
 
     def owns(self, header_id: str) -> bool:
         return header_id not in self.foreign
+
+    def holds(self, header_id: str, duty: float) -> bool:
+        self.holds_calls.append(header_id)
+        return self.pwm.get(header_id) == duty_to_pwm(duty)
 
     def retake(self, header_id: str) -> None:
         self.retakes.append(header_id)

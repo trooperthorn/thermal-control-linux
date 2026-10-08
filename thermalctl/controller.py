@@ -21,6 +21,7 @@ from pathlib import Path
 
 from . import __version__
 from .backend import Backend
+from .backends.sysfs import duty_to_pwm
 from .config import (
     DEFAULT_OVERRIDES_PATH, Config, ConfigError, Header, OverrideReport, apply_overrides,
     load_config,
@@ -35,6 +36,12 @@ from .smoothing import Ema, OutputShaper, apply_floor
 DEFAULT_STATUS_PATH = "/run/thermalctl/status.json"
 CYCLE_ERROR = "cycle_error"
 EXTERNAL_CHANGE = "external_change"
+# A duty that has not changed is written again after this many cycles, whatever the
+# verification read says, so any drift the read cannot see is corrected. 60 cycles is two
+# minutes at the default 2 second interval.
+FORCE_REFRESH_CYCLES = 60
+# Marks a header handed to firmware control in the applied-state table, which has no duty.
+_RELEASED = -1
 
 audit = logging.getLogger("thermalctl.audit")
 log = logging.getLogger("thermalctl")
@@ -170,8 +177,17 @@ class Controller:
         config_path: str | Path | None = None,
         overrides_report: OverrideReport | None = None,
         base_config: Config | None = None,
+        refresh_cycles: int = FORCE_REFRESH_CYCLES,
     ) -> None:
         self.backend = backend
+        # What was last written per header: the register value (or _RELEASED) and the cycles
+        # since it was written. A duty is written only when it differs from this, when the
+        # verification read disagrees, or when refresh_cycles have passed.
+        self.refresh_cycles = max(1, int(refresh_cycles))
+        self._applied: dict[str, tuple[int, int]] = {}
+        # pwm_enable ownership as read this cycle, so one read serves the safety check and
+        # the failsafe verification.
+        self._owned: dict[str, bool] = {}
         # Headers whose failsafe write failed and was already audited; cleared on success.
         self._write_failed: set[str] = set()
         self.status_path = Path(status_path)
@@ -250,6 +266,8 @@ class Controller:
     def _build(self, config: Config) -> None:
         old = self.safety
         self.safety = {}
+        # A new config may change a floor or a mapping, so every header is written afresh.
+        self._applied.clear()
         for header in config.headers:
             machine = HeaderSafety(header, self.hold_s, config.mode == "active")
             prior = old.get(header.id)
@@ -294,6 +312,7 @@ class Controller:
                 log.exception("release write failed for %s", header.id)
             self.commanded[header.id] = duty or None
             self.duty[header.id] = duty
+            self._applied.pop(header.id, None)
             if header.id in self.shapers:
                 self.shapers[header.id].reset(100.0)
 
@@ -577,17 +596,63 @@ class Controller:
         self.commanded[header.id] = duty or None
         if self._enabled(header):
             try:
-                if duty == 0.0:
-                    self.backend.release(header.id)
-                else:
-                    # Another tool may have switched the chip to an automatic mode, which
-                    # can ignore pwm writes, so take manual mode back before full speed.
-                    self.backend.retake(header.id)
-                    self.backend.write_duty(header.id, duty)
+                self._hold_failsafe(header, duty)
                 self._write_failed.discard(header.id)
             except Exception:
                 log.exception("failsafe write failed for %s", header.id)
+                self._applied.pop(header.id, None)
                 self._hand_to_firmware(header)
+
+    def _owned_now(self, header: Header) -> bool:
+        """pwm_enable ownership, reusing this cycle's read when the safety check made one."""
+        owned = self._owned.get(header.id)
+        if owned is None:
+            try:
+                owned = self.backend.owns(header.id)
+            except Exception:
+                owned = False
+        return owned
+
+    def _holds(self, header: Header, duty: float) -> bool:
+        try:
+            return bool(self.backend.holds(header.id, duty))
+        except Exception:
+            return False
+
+    def _hold_failsafe(self, header: Header, duty: float) -> None:
+        """Write the failsafe state once, then only verify it with reads.
+
+        The write is manual mode and full speed (or the release to firmware). On later
+        cycles the mode read and the duty read confirm it, and either one differing from
+        what was written triggers the write again in the same cycle, so an external change
+        is corrected within one cycle. The write is also repeated every refresh_cycles.
+        """
+        target = duty_to_pwm(duty) if duty != 0.0 else _RELEASED
+        previous = self._applied.get(header.id)
+        if previous is not None and previous[0] == target and previous[1] + 1 < self.refresh_cycles:
+            verified = self._owned_now(header) and (target == _RELEASED or self._holds(header, duty))
+            if verified:
+                self._applied[header.id] = (target, previous[1] + 1)
+                return
+        if duty == 0.0:
+            self.backend.release(header.id)
+        else:
+            # Another tool may have switched the chip to an automatic mode, which can
+            # ignore pwm writes, so take manual mode back before full speed.
+            self.backend.retake(header.id)
+            self.backend.write_duty(header.id, duty)
+        self._applied[header.id] = (target, 0)
+
+    def _write_active(self, header: Header, duty: float) -> None:
+        """Write a computed duty only when the register would change or may have drifted."""
+        target = duty_to_pwm(duty)
+        previous = self._applied.get(header.id)
+        if previous is not None and previous[0] == target and previous[1] + 1 < self.refresh_cycles:
+            if self._holds(header, duty):
+                self._applied[header.id] = (target, previous[1] + 1)
+                return
+        self.backend.write_duty(header.id, duty)
+        self._applied[header.id] = (target, 0)
 
     def _hand_to_firmware(self, header: Header) -> None:
         """The full speed write failed, so give the header back to the chip and say so.
@@ -627,6 +692,7 @@ class Controller:
         readings: dict[str, Reading] = {}
         rpms: dict[str, float | None] = {}
         previous = {hid: m.state for hid, m in self.safety.items()}
+        self._owned = {}
         try:
             readings = dict(self.backend.read_inputs())
             rpms = {h.id: self.backend.read_rpm(h.id) for h in self.config.headers}
@@ -637,11 +703,11 @@ class Controller:
             dt = 0.0 if self.last_time is None else max(0.0, now - self.last_time)
             zones = {z.id: z for z in self.config.zones}
             for header in self.config.headers:
-                lost = (
-                    (f"{EXTERNAL_CHANGE}:{header.id}",)
-                    if self._enabled(header) and not self.backend.owns(header.id)
-                    else ()
-                )
+                lost: tuple[str, ...] = ()
+                if self._enabled(header):
+                    self._owned[header.id] = self.backend.owns(header.id)
+                    if not self._owned[header.id]:
+                        lost = (f"{EXTERNAL_CHANGE}:{header.id}",)
                 self.safety[header.id].update(
                     now,
                     extra_causes=lost,
@@ -663,14 +729,17 @@ class Controller:
                 if previous.get(header.id) == FAILSAFE and self._enabled(header):
                     # Leaving failsafe: release() may have handed the header to firmware.
                     self.backend.retake(header.id)
+                    # Whatever the failsafe left is not a duty this loop wrote.
+                    self._applied.pop(header.id, None)
                 duty = self._header_duty(header, smoothed, dt)
                 self.duty[header.id] = duty
                 self.commanded[header.id] = duty
                 if self._enabled(header):
-                    self.backend.write_duty(header.id, duty)
+                    self._write_active(header, duty)
         except Exception as exc:
             log.exception("cycle failed, forcing failsafe on every header")
             self._force_failsafe_all(now, f"{CYCLE_ERROR}:{type(exc).__name__}")
+        self._owned = {}
         self.last_time = now
         for hid, machine in self.safety.items():
             if previous.get(hid) != machine.state:
