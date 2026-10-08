@@ -85,7 +85,7 @@ class SysfsBackend:
         mapped: Iterable[str],
         state_file: str | Path,
         active: bool = False,
-        clock: Callable[[], float] = time.time,
+        clock: Callable[[], float] = time.monotonic,
         input_scale: float = 1000.0,
     ) -> None:
         self.headers = dict(headers)
@@ -100,6 +100,9 @@ class SysfsBackend:
         # The pwmN_enable value this backend last set per header; anything else is foreign.
         self.expected: dict[str, int] = {}
         self.started = False
+        # Per input: the last value read and the clock time it last differed from the one
+        # before. A reading is stamped with that time, not with the time of the read.
+        self._changed: dict[str, tuple[float, float]] = {}
 
     def _controlled(self, header_id: str) -> bool:
         return self.active and header_id in self.mapped and header_id in self.originals
@@ -284,14 +287,30 @@ class SysfsBackend:
     # Backend interface -----------------------------------------------------------
 
     def read_inputs(self) -> Mapping[str, Reading]:
-        """Return a reading per input; an unreadable input has value None."""
+        """Return a reading per input; an unreadable input has value None.
+
+        A reading is stamped with the time its value last changed, not the time it was read.
+        A sensor whose chip has stopped updating keeps returning the same number, and a
+        stamp of the read time would make that look fresh for ever. So a value that has not
+        changed for stale_after_s counts as stale (the frozen-sensor rule). A sensor that
+        legitimately holds one value for longer than stale_after_s is therefore treated as
+        failed, which is the safe direction: pick a stale_after_s longer than that.
+        """
         now = self.clock()
         result: dict[str, Reading] = {}
         for name, path in self.inputs.items():
             try:
-                result[name] = Reading(float(_read_text(path)) / self.input_scale, now)
+                value = float(_read_text(path)) / self.input_scale
             except (OSError, ValueError):
+                self._changed.pop(name, None)
                 result[name] = Reading(None, None)
+                continue
+            seen = self._changed.get(name)
+            # NaN never equals itself, so it counts as a change; the safety check rejects it.
+            if seen is None or seen[0] != value:
+                seen = (value, now)
+                self._changed[name] = seen
+            result[name] = Reading(value, seen[1])
         return result
 
     def read_rpm(self, header_id: str) -> float | None:

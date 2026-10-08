@@ -35,13 +35,16 @@ class LoadBackend:
         self,
         inner: Backend,
         proc_stat: str = "/proc/stat",
-        clock: Callable[[], float] = time.time,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.inner = inner
         self.proc_stat = proc_stat
         self.clock = clock
         self._last: tuple[float, float] | None = None
         self._value: float | None = None
+        # When _value was computed. A reading is stamped with this, never with the read time,
+        # so a value that is no longer being refreshed ages and goes stale.
+        self._value_time: float | None = None
         self._errored = False
         self._reads = 0
         self._sample()  # Prime, so the first cycle already has a delta to work with.
@@ -53,11 +56,19 @@ class LoadBackend:
             self._errored = True
             self._last = None
             self._value = None
+            self._value_time = None
             return
         if self._last is not None:
             d_total = total - self._last[1]
             if d_total > 0:
                 self._value = max(0.0, min(100.0, 100.0 * (busy - self._last[0]) / d_total))
+                self._value_time = self.clock()
+            elif d_total < 0:
+                # The counters went backwards (CPU hotplug, a reset). The old value no
+                # longer describes anything, so report none until a new delta exists.
+                self._value = None
+                self._value_time = None
+            # d_total == 0: no time passed between reads; keep the value and its old stamp.
         self._last = (busy, total)
 
     def read_inputs(self) -> Mapping[str, Reading]:
@@ -68,10 +79,10 @@ class LoadBackend:
             # The first cycle reuses no delta, so the controller works from temperature
             # alone. This is warm-up, not a fault.
             result[LOAD_INPUT] = Reading(None, None, warming_up=True)
-        elif self._value is None:
+        elif self._value is None or self._value_time is None:
             result[LOAD_INPUT] = Reading(None, None)
         else:
-            result[LOAD_INPUT] = Reading(self._value, self.clock())
+            result[LOAD_INPUT] = Reading(self._value, self._value_time)
         return result
 
     def read_rpm(self, header_id: str) -> float | None:

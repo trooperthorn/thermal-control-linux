@@ -116,6 +116,11 @@ problem, which the controller treats as a fail-safe cause. The top level holds `
 - A header has `id`, `path`, `mapped` (default false), `min_duty`, `min_rpm`,
   `stall_window_s`, `zones`, a list of zone ids that must exist, and optionally
   `min_rpm_duty` (default 50), the commanded duty from which `min_rpm` is enforced.
+- No two headers may name the same pwm file. The check runs when the config loads, on the
+  path text after normalising separators and dot segments, and again after chip references
+  are resolved, because `nct6779:pwm1` and the real path of that file are one file. Two
+  headers on one file would write different duties to it and the fan would follow whichever
+  wrote last. `stale_after_s` and `stall_window_s` must be finite and above 0.
 - A header may also set `min_duty_limit` (default `min_duty`, never above it), the lowest
   floor an override may set.
 - A zone may set `plausible_min_c` and `plausible_max_c` (defaults -20 and 150). Readings
@@ -212,11 +217,31 @@ makes two `pwmN_enable` writes per cycle and is briefly in manual mode; the audi
 written once per episode, not once per cycle. If the recorded original is manual, release
 writes 255 first and falls back to mode 5 when that fails.
 
+Clocks. Every timer (the hold period, the stall, low RPM and slow fan windows, and the
+staleness check) and every reading timestamp runs on a monotonic clock, `time.monotonic`
+by default, so a step of the wall clock from NTP, an RTC-less boot or a VM resume can
+neither stop a timer nor finish one early. The sysfs backend and the load reader stamp
+readings from that clock. Only the status file uses wall time (`timestamp` and each
+header's `last_change`), because hostwatch compares them with its own wall clock; the
+controller converts a timer instant to wall time by its age when it writes the file.
+
+Frozen sensor rule. The sysfs backend stamps a temperature reading with the time its value
+last changed, not the time it was read. A sensor whose value has not changed for
+`stale_after_s` is therefore stale, which catches a chip that stopped updating but still
+returns its last number. The cost is that a sensor which legitimately holds one value for
+longer than `stale_after_s` is treated as failed and the header goes to full speed, so
+`stale_after_s` must exceed the longest steady period of the real sensor (see
+UNVERIFIED.md). The CPU load input is stamped with the time its value was last computed. If
+the `/proc/stat` counters go backwards the value is dropped and the input is missing until
+a new delta exists, and if they do not move the old stamp is kept so the value ages.
+
 The status file is written every cycle to a temp file in the same directory and renamed
 over the target, so a reader sees the old or the new document and never a partial one. The
 path is a constructor argument defaulting to `/run/thermalctl/status.json`; a failed write
 is logged, its uniquely named temp file is removed, and the previous file is left in place.
-It holds version, timestamp, mode,
+A writer killed between creating the temp file and the rename leaves it behind, so `run`
+removes every `<status name>.*.tmp` file beside the status file once it holds the ownership
+lock. The file is strict JSON: a non-finite number is written as `null`. It holds version, timestamp, mode,
 `config_valid`, per-zone inputs and curves, and per-header state, duty, RPM, reasons and
 last change.
 
@@ -288,7 +313,7 @@ status file, and does not enter failsafe. From the second cycle the load is used
 that cannot be read after that is still a missing input; any other `load_input` name
 is rejected by `check-config` and `run`. An invalid config at start leaves every fan
 untouched under firmware control and exits 1. `status` prints the status file and exits
-1 when it is missing or older than `--max-age`. `check-config PATH` validates only.
+1 when it is missing or older than `--max-age` (a finite number of 0 or more). `run --interval` must be a finite number from 0.05 to 300 seconds; anything else, including `nan` and `inf`, exits 2 before any hardware is touched. `check-config PATH` validates only.
 `restore` first checks the ownership lock and exits 1 while another process holds it
 (`--force` skips that check), then calls `restore_from_state_file` on the persisted originals
 and exits 1 when the file is untrusted or any header fell back to full speed.

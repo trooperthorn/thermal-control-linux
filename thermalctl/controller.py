@@ -9,6 +9,7 @@ fan slower than it should be or stop the service.
 
 from __future__ import annotations
 
+import glob
 import json
 import logging
 import math
@@ -39,10 +40,56 @@ audit = logging.getLogger("thermalctl.audit")
 log = logging.getLogger("thermalctl")
 
 
+def strict_json_safe(value: object) -> object:
+    """Copy a document with every non-finite float replaced by None.
+
+    NaN and Infinity are not JSON. Python writes them as bare words that a strict parser
+    such as the one in hostwatch rejects, which would turn one bad number into an unreadable
+    status file. null says "no value" and every reader already handles it.
+    """
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: strict_json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [strict_json_safe(v) for v in value]
+    return value
+
+
+def status_temp_files(path: str | Path) -> list[Path]:
+    """The temp files write_status_atomic may have left beside the status file."""
+    target = Path(path)
+    try:
+        return sorted(
+            p for p in target.parent.glob(glob.escape(target.name) + ".*.tmp") if p.is_file()
+        )
+    except OSError:
+        return []
+
+
+def remove_stale_status_temps(path: str | Path) -> list[Path]:
+    """Delete temp files left by a writer that was killed between create and rename.
+
+    Only call this while holding the ownership lock, so no live writer owns one of them.
+    Returns the files removed. A file that cannot be removed is logged and skipped.
+    """
+    removed: list[Path] = []
+    for temp in status_temp_files(path):
+        try:
+            temp.unlink()
+        except OSError as exc:
+            log.warning("cannot remove stale status temp file %s: %s", temp, exc)
+        else:
+            removed.append(temp)
+            log.info("removed stale status temp file %s", temp)
+    return removed
+
+
 def write_status_atomic(path: str | Path, document: dict) -> None:
     """Write JSON to a uniquely named temp file beside the target, then rename over it.
 
-    On any failure the temp file is removed and the previous target is left intact.
+    On any failure the temp file is removed and the previous target is left intact. The
+    output is strict JSON: a non-finite number is written as null.
     """
     target = Path(path)
     descriptor, temp_name = tempfile.mkstemp(
@@ -50,7 +97,9 @@ def write_status_atomic(path: str | Path, document: dict) -> None:
     )
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
-            json.dump(document, handle, indent=2, sort_keys=True)
+            json.dump(
+                strict_json_safe(document), handle, indent=2, sort_keys=True, allow_nan=False
+            )
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
@@ -109,7 +158,8 @@ class Controller:
         backend: Backend,
         *,
         status_path: str | Path = DEFAULT_STATUS_PATH,
-        clock: Callable[[], float] = time.time,
+        clock: Callable[[], float] | None = None,
+        wall_clock: Callable[[], float] | None = None,
         hold_s: float = 30.0,
         ema_alpha: float = 0.5,
         hysteresis: float = 2.0,
@@ -124,7 +174,17 @@ class Controller:
         # Headers whose failsafe write failed and was already audited; cleared on success.
         self._write_failed: set[str] = set()
         self.status_path = Path(status_path)
-        self.clock = clock
+        # Every timer (stall, low rpm, slow fan, hold, staleness) runs on this clock, which
+        # must be monotonic: a step of the wall clock (NTP, RTC-less boot, VM resume) must
+        # neither stop a timer nor finish one early. Sensor readings must be stamped from
+        # the same clock. The default is time.monotonic.
+        self.clock = time.monotonic if clock is None else clock
+        # Only the status file's timestamps use wall time, because hostwatch compares them
+        # with its own wall clock. An injected clock with no wall clock serves both, which
+        # keeps fake-clock tests simple.
+        self.wall_clock = (
+            wall_clock if wall_clock is not None else (time.time if clock is None else self.clock)
+        )
         self.hold_s = hold_s
         self.ema_alpha = ema_alpha
         self.hysteresis = hysteresis
@@ -512,13 +572,19 @@ class Controller:
         return document
 
     def _status(self, now: float, readings: dict, rpms: dict) -> dict:
+        wall_now = self.wall_clock()
+
+        def wall(stamp: float | None) -> float | None:
+            """A timer-clock instant as wall time, by its age, so the file never mixes clocks."""
+            return None if stamp is None else wall_now - (now - stamp)
+
         def val(name: str | None) -> float | None:
             reading = readings.get(name) if name else None
             return None if reading is None else _finite(reading.value)
 
         return {
             "version": __version__,
-            "timestamp": now,
+            "timestamp": wall_now,
             "mode": self.config.mode,
             "config_valid": self.config_valid,
             "overrides_applied": self.overrides_applied,
@@ -544,7 +610,7 @@ class Controller:
                     "rpm": _finite(rpms.get(h.id)),
                     "reasons": list(self.safety[h.id].reasons),
                     "notes": list(self.notes.get(h.id, [])),
-                    "last_change": self.safety[h.id].last_change,
+                    "last_change": wall(self.safety[h.id].last_change),
                     "zones": list(h.zones),
                 }
                 for h in self.config.headers

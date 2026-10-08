@@ -208,6 +208,25 @@ def _header(table: object, index: int, zone_ids: set[str]) -> Header:
     )
 
 
+def check_unique_paths(headers: tuple[Header, ...]) -> None:
+    """Refuse two headers that drive the same pwm file.
+
+    The two would each write their own duty to one file, so the fan would follow whichever
+    wrote last, which can be the lower one while the other header's zone is hot. Paths are
+    compared after normalising separators and dot segments. The check runs again once chip
+    references are resolved, because nct6779:pwm1 and the real path name one file.
+    """
+    owner: dict[str, str] = {}
+    for header in headers:
+        key = os.path.normpath(header.path.replace("\\", "/"))
+        if key in owner:
+            raise ConfigError(
+                f"headers {owner[key]} and {header.id} use the same pwm file {header.path}; "
+                "each header needs its own"
+            )
+        owner[key] = header.id
+
+
 def parse_config(data: dict) -> Config:
     """Validate an already parsed TOML document."""
     mode = data.get("mode", "dry_run")
@@ -227,6 +246,7 @@ def parse_config(data: dict) -> Config:
     header_ids = [h.id for h in headers]
     if len(set(header_ids)) != len(header_ids):
         raise ConfigError("header ids must be unique")
+    check_unique_paths(headers)
     return Config(mode=mode, zones=zones, headers=headers)
 
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import signal
 import sys
 import time
@@ -27,7 +28,7 @@ from .config import (
     DEFAULT_OVERRIDES_PATH, Config, ConfigError, OverrideReport, apply_overrides, load_config,
     load_effective,
 )
-from .controller import DEFAULT_STATUS_PATH, Controller
+from .controller import DEFAULT_STATUS_PATH, Controller, remove_stale_status_temps
 from .hwmon import DEFAULT_HWMON_ROOT, HwmonError, resolve_config
 from .load import SUPPORTED_LOAD_INPUTS, LoadBackend
 from .lock import LockHeld, OwnerLock, default_lock_path, is_held
@@ -36,10 +37,35 @@ from .notify import Notifier
 
 DEFAULT_STATE_FILE = "/run/thermalctl/state.json"
 DEFAULT_INTERVAL_S = 2.0
+# The cycle interval must be a finite number in this range. NaN passes a plain "greater than
+# zero" test and makes the loop's sleep fail, and an interval of hours would leave every
+# stall and staleness timer blind between cycles.
+INTERVAL_RANGE_S = (0.05, 300.0)
 DEFAULT_MAX_AGE_S = 30.0
 MAPPING_SETTLE_S = 8.0
 
 log = logging.getLogger("thermalctl")
+
+
+def interval_problem(value: float) -> str | None:
+    """Why a cycle interval is unusable, or None when it is fine."""
+    low, high = INTERVAL_RANGE_S
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+        return "--interval must be a finite number"
+    if not low <= value <= high:
+        return f"--interval must be between {low:g} and {high:g} seconds"
+    return None
+
+
+def _max_age_arg(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number") from None
+    # NaN would make every age test false, so a dead service would report as fresh.
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError("must be a finite number of 0 or more")
+    return value
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -59,7 +85,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     status = sub.add_parser("status", help="print the status file the service writes")
     status.add_argument("--status-path", default=DEFAULT_STATUS_PATH)
-    status.add_argument("--max-age", type=float, default=DEFAULT_MAX_AGE_S)
+    status.add_argument("--max-age", type=_max_age_arg, default=DEFAULT_MAX_AGE_S)
     status.add_argument("--json", action="store_true", help="print the raw document")
 
     check = sub.add_parser("check-config", help="validate a config file and change nothing")
@@ -147,6 +173,10 @@ def run_service(
     overrides_path: str = DEFAULT_OVERRIDES_PATH,
 ) -> int:
     notifier = Notifier() if notifier is None else notifier
+    problem = interval_problem(interval_s)
+    if problem is not None:
+        _err(problem)
+        return 2
     try:
         config = load_config(config_path)
     except Exception as exc:
@@ -220,6 +250,9 @@ def _serve(
 
     if hasattr(signal, "SIGHUP"):
         signal.signal(signal.SIGHUP, on_hup)
+    # The ownership lock is held, so no other writer owns a temp file beside the status
+    # file. Any left there was abandoned by a killed run.
+    remove_stale_status_temps(status_path)
     sysfs = build_backend(config, state_file)
     install_signal_handlers()
 
@@ -425,8 +458,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if args.command == "run":
         logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
-        if args.interval <= 0:
-            _err("--interval must be positive")
+        problem = interval_problem(args.interval)
+        if problem is not None:
+            _err(problem)
             return 2
         return run_service(
             args.config, args.status_path, args.state_file, args.interval,

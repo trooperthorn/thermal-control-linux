@@ -11,6 +11,7 @@ measured are listed in `UNVERIFIED.md`.
 - `thermalctl run --config PATH` runs the control loop. It is a dry run unless the config
   says `mode = "active"`, and even then it writes only to headers marked `mapped = true`.
 - `thermalctl run` and `check-config` also read an optional overrides file, `/etc/thermalctl/overrides.toml` by default or `--overrides PATH`. See the overrides section below.
+- `thermalctl run --interval` must be a finite number from 0.05 to 300 seconds. Two headers may not use the same pwm file. A sensor whose value does not change for `stale_after_s` is treated as stale and sends its headers to full speed, so choose a `stale_after_s` longer than the longest time your sensor holds one reading.
 - `thermalctl status` prints the status file the service writes: each zone's temperature and CPU load, then each header's state, duty, RPM and reasons. `--json` prints it raw.
   It exits non-zero when the file is missing or older than `--max-age` seconds.
 - `thermalctl check-config PATH` validates a config file and changes nothing. It rejects curves whose duty falls as the input rises and temperature curves that do not reach 100 percent at or below `hard_max_temp_c`.
@@ -135,5 +136,5 @@ The service writes `/run/thermalctl/status.json` atomically every cycle. hostwat
 that file read-only and raises alerts for fail-safe, stall and over temperature; it never
 sets a target or writes to hardware. Point hostwatch at that path as a file source. The
 document holds the version, timestamp, mode, per-zone temperature and load, and per
-header state, duty, RPM, effective `min_duty` and fail-safe reasons, plus `overrides_applied` and `overrides_error` at the top level. `thermalctl status` shows the same data
+header state, duty, RPM, effective `min_duty` and fail-safe reasons, plus `overrides_applied` and `overrides_error` at the top level. The file is strict JSON, with `null` for any missing number, and its timestamps are wall clock time; the service's own timers use a monotonic clock, so a clock step cannot disable the stall or hold timers. `thermalctl status` shows the same data
 for a person at a shell.

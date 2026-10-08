@@ -12,7 +12,7 @@ from __future__ import annotations
 import dataclasses
 from pathlib import Path
 
-from .config import CHIP_REF, Config
+from .config import CHIP_REF, Config, ConfigError, check_unique_paths
 
 DEFAULT_HWMON_ROOT = "/sys/class/hwmon"
 
@@ -70,4 +70,9 @@ def resolve_config(config: Config, root: str | Path = DEFAULT_HWMON_ROOT) -> Con
     headers = tuple(
         dataclasses.replace(h, path=resolve_ref(h.path, root)) for h in config.headers
     )
+    try:
+        check_unique_paths(headers)
+    except ConfigError as exc:
+        # Callers already treat HwmonError as "touch no hardware".
+        raise HwmonError(str(exc)) from exc
     return dataclasses.replace(config, zones=zones, headers=headers)
