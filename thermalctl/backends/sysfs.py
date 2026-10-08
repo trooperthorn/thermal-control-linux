@@ -22,6 +22,7 @@ from pathlib import Path
 from ..safety import Reading
 
 log = logging.getLogger("thermalctl.sysfs")
+audit = logging.getLogger("thermalctl.audit")
 
 MANUAL = 1
 FULL_PWM = 255
@@ -138,29 +139,60 @@ class SysfsBackend:
             raise BackendError(f"cannot take control of fans: {exc}") from exc
 
     def _recover_from_bad_state_file(self, exc: StateFileError) -> None:
-        """Hand every mapped header to firmware control without the saved originals.
+        """Hand each mapped header still in manual mode to firmware control.
 
-        A header still in manual mode gets full speed first, so that if the mode write
-        fails the fan is not left at a stale low duty. The bad file is renamed to keep it
-        for diagnosis, so the next start does not read it again.
+        A header in manual mode gets full speed first, so that if the mode write fails the
+        fan is not left at a stale low duty, then firmware mode. A header whose mode cannot
+        be read is treated the same way. A header already in another mode is under chip
+        control, possibly in its true original mode, so it is left alone and start records
+        that mode as the original. The bad file is renamed to keep it for diagnosis, under
+        a fresh name when an earlier one is already kept, so the next start does not read
+        it again. Every mode change goes to the audit log with its old and new value.
         """
-        log.error("state file unusable (%s); restoring every mapped header to firmware mode", exc)
+        log.error("state file unusable (%s); restoring manual mapped headers to firmware mode", exc)
         for header_id in sorted(self.mapped):
             pwm = self.headers[header_id]
             try:
-                if int(_read_text(_enable_path(pwm))) == MANUAL:
+                old: int | None = int(_read_text(_enable_path(pwm)))
+            except (OSError, ValueError):
+                old = None
+            if old is not None and old != MANUAL:
+                audit.info("header %s left in mode %s: not in manual mode", header_id, old)
+                continue
+            full_speed = False
+            if old == MANUAL:
+                try:
                     _write_int(pwm, FULL_PWM)
-            except (OSError, ValueError) as err:
-                log.error("full speed write to %s failed: %s", header_id, err)
+                    full_speed = True
+                except OSError as err:
+                    log.error("full speed write to %s failed: %s", header_id, err)
             try:
                 _write_int(_enable_path(pwm), FIRMWARE_MODE)
             except OSError as err:
-                log.error("firmware mode write to %s failed: %s; fan left at full speed", header_id, err)
+                audit.error(
+                    "header %s mode %s to %s failed: %s; %s",
+                    header_id, "unreadable" if old is None else old, FIRMWARE_MODE, err,
+                    "fan left at full speed" if full_speed else "fan left as it was",
+                )
+            else:
+                audit.warning(
+                    "header %s mode %s to %s (state file unusable)",
+                    header_id, "unreadable" if old is None else old, FIRMWARE_MODE,
+                )
         bad = self.state_file.with_name(self.state_file.name + ".bad")
+        n = 1
+        while bad.exists():
+            bad = self.state_file.with_name(f"{self.state_file.name}.bad.{n}")
+            n += 1
         try:
             os.replace(self.state_file, bad)
         except OSError as err:
             log.error("cannot set aside state file %s: %s", self.state_file, err)
+
+    def recover_from_bad_state_file(self, exc: StateFileError) -> None:
+        """Public entry for the restore command, which has no running service."""
+        if self.active:
+            self._recover_from_bad_state_file(exc)
 
     def restore(self) -> None:
         """Write full speed, then restore every recorded pwmN_enable.
@@ -295,9 +327,18 @@ class SysfsBackend:
         if not self._controlled(header_id):
             return
         pwm = self.headers[header_id]
+        target = self.originals[header_id]
+        if target == MANUAL:
+            # A manual original keeps the stale duty, so full speed goes in first. If that
+            # write fails, firmware control is the only state left that cannot hold it low.
+            try:
+                _write_int(pwm, FULL_PWM)
+            except OSError as exc:
+                log.error("full speed write to %s failed: %s; trying firmware mode", header_id, exc)
+                target = FIRMWARE_MODE
         try:
-            _write_int(_enable_path(pwm), self.originals[header_id])
-            self.expected[header_id] = self.originals[header_id]
+            _write_int(_enable_path(pwm), target)
+            self.expected[header_id] = target
         except OSError as exc:
             log.error("release of %s failed (%s); writing full speed", header_id, exc)
             try:

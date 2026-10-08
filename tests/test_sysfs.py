@@ -349,3 +349,51 @@ def test_restore_skips_full_speed_write_for_header_already_in_firmware_mode(tree
     assert b.restore_failures == []
     assert "full speed write to p1 failed" not in caplog.text
     assert text(tree / "pwm1_enable") == "5"
+
+
+@pytest.mark.parametrize("enable", ["0", "2", "5"])
+def test_corrupt_state_recovery_leaves_non_manual_headers_alone(tree, tmp_path, enable):
+    """A header already under chip control keeps its mode, and that mode is recorded as original."""
+    put(tree / "pwm1_enable", enable + "\n")
+    put(tree / "pwm1", "77\n")
+    (tmp_path / "state.json").write_text("{bad", encoding="utf-8")
+    b = make(tree, tmp_path)
+    b.start()
+    assert b.originals["p1"] == int(enable)
+    b.restore()
+    assert text(tree / "pwm1_enable") == enable
+
+
+def test_corrupt_state_recovery_writes_only_manual_headers(tree, tmp_path):
+    put(tree / "pwm1_enable", "1\n")
+    put(tree / "pwm2_enable", "0\n")
+    put(tree / "pwm2", "40\n")
+    (tmp_path / "state.json").write_text("{bad", encoding="utf-8")
+    b = make(tree, tmp_path)
+    b._recover_from_bad_state_file(StateFileError("test"))
+    assert text(tree / "pwm1") == "255" and text(tree / "pwm1_enable") == "5"
+    assert text(tree / "pwm2") == "40" and text(tree / "pwm2_enable") == "0"
+
+
+def test_corrupt_state_recovery_audits_and_keeps_earlier_bad_file(tree, tmp_path, caplog):
+    put(tree / "pwm1_enable", "1\n")
+    (tmp_path / "state.json.bad").write_text("old", encoding="utf-8")
+    (tmp_path / "state.json").write_text("{bad", encoding="utf-8")
+    with caplog.at_level("INFO", logger="thermalctl.audit"):
+        make(tree, tmp_path)._recover_from_bad_state_file(StateFileError("test"))
+    assert (tmp_path / "state.json.bad").read_text(encoding="utf-8") == "old"
+    assert (tmp_path / "state.json.bad.1").read_text(encoding="utf-8") == "{bad"
+    assert any("p1 mode 1 to 5" in r.getMessage() for r in caplog.records)
+
+
+def test_release_of_manual_original_writes_full_speed_then_firmware_if_that_fails(tree, tmp_path):
+    put(tree / "pwm1_enable", "1\n")
+    b = make(tree, tmp_path)
+    b.start()
+    b.write_duty("p1", 10.0)
+    b.release("p1")
+    assert text(tree / "pwm1") == "255" and text(tree / "pwm1_enable") == "1"
+    b.write_duty("p1", 10.0)
+    break_file(tree / "pwm1")
+    b.release("p1")
+    assert text(tree / "pwm1_enable") == "5"

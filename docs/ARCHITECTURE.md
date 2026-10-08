@@ -201,7 +201,11 @@ If the full speed write (or the manual mode write before it) fails for an enable
 the controller calls `release()` on that header at once, so the chip's own control takes
 over instead of the fan keeping its last low duty. The header reports duty 0, the note
 `failsafe_write_failed`, and an error line in the audit log, and the same attempt is made
-again on every cycle while the header stays in failsafe.
+again on every cycle while the header stays in failsafe. Each attempt writes manual mode
+(retake), fails the 255 write, then writes the original mode (release), so a stuck header
+makes two `pwmN_enable` writes per cycle and is briefly in manual mode; the audit line is
+written once per episode, not once per cycle. If the recorded original is manual, release
+writes 255 first and falls back to mode 5 when that fails.
 
 The status file is written every cycle to a temp file in the same directory and renamed
 over the target, so a reader sees the old or the new document and never a partial one. The
@@ -243,9 +247,10 @@ fan file gives an RPM of None.
 On `start()` in active mode it reads `pwmN_enable` for every mapped header, saves the
 originals to the state file with an atomic rename, and only then writes manual mode. If
 a state file left by a killed run is truncated, corrupt or untrusted, start does not
-refuse: for every mapped header still in manual mode it writes 255, then writes
-`pwmN_enable` 5 (firmware control, unverified for other chips, see `UNVERIFIED.md`),
-renames the file to `<state file>.bad` for diagnosis, and goes on to record fresh
+refuse: for every mapped header still in manual mode (or whose mode cannot be read) it
+writes 255, then writes `pwmN_enable` 5 (firmware control, unverified for other chips, see `UNVERIFIED.md`),
+leaves every header in another mode untouched, audits each mode change with old and new
+value, renames the file to `<state file>.bad` (or `.bad.N` when one is kept) for diagnosis, and goes on to record fresh
 originals. A state file that parses but whose restore fails on the hardware still blocks
 start. In
 dry run, or for an unmapped header, it never writes anything. `write_duty` scales the duty
@@ -287,5 +292,5 @@ so it prints the result and the owner sets `mapped = true` by hand.
 library. `run` sends `READY=1` after start, `WATCHDOG=1` once per cycle and `STOPPING=1`
 on the way out. `packaging/thermalctl.service` is `Type=notify` with `WatchdogSec=30`
 against a 2 second cycle, `Restart=always`, a `RuntimeDirectory` holding the status and
-state files, and `ExecStopPost=thermalctl restore --force`. The config is read at start only;
+state files, and `ExecStopPost=thermalctl restore --force --config /etc/thermalctl/config.toml`. The config is read at start only;
 there is no reload signal yet.

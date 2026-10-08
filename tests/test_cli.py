@@ -467,6 +467,17 @@ def test_restore_refuses_while_the_lock_is_held_and_force_works(tmp_path, capsys
         holder.release()
 
 
+def test_restore_with_config_recovers_from_a_corrupt_state_file(tmp_path):
+    tree, config, state = killed_service_state(tmp_path)
+    state.write_text("{bad", encoding="utf-8")
+    assert main(["restore", "--state-file", str(state), "--force"]) == 1
+    assert (tree / "pwm1_enable").read_text() == "1\n"
+    assert main(["restore", "--state-file", str(state), "--force", "--config", str(config)]) == 0
+    assert (tree / "pwm1_enable").read_text() == "5\n"
+    assert (tree / "pwm1").read_text() == "255\n"
+    assert (tmp_path / "state.json.bad").exists()
+
+
 def test_restore_works_once_the_lock_is_released(tmp_path):
     tree, _config, state = killed_service_state(tmp_path)
     holder = OwnerLock(tmp_path / "thermalctl.lock")
@@ -535,7 +546,7 @@ def test_second_service_cannot_start_while_the_lock_is_held(tmp_path, capsys):
 
 def test_unit_restore_uses_force():
     text = (ROOT / "packaging" / "thermalctl.service").read_text(encoding="utf-8")
-    assert re.search(r"^ExecStopPost=\S*thermalctl restore --force$", text, re.M)
+    assert re.search(r"^ExecStopPost=\S*thermalctl restore --force --config \S+$", text, re.M)
 
 
 # -- external change of pwm_enable -----------------------------------------------------

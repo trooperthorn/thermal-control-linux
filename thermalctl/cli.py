@@ -66,6 +66,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     restore = sub.add_parser("restore", help="restore the persisted original fan modes")
     restore.add_argument("--state-file", default=DEFAULT_STATE_FILE)
+    restore.add_argument(
+        "--config",
+        default=None,
+        help="config file; lets restore find the mapped headers when the state file is corrupt",
+    )
     restore.add_argument("--lock-file", default=None, help="ownership lock (default: beside the state file)")
     restore.add_argument(
         "--force",
@@ -298,6 +303,17 @@ def cmd_restore(args: argparse.Namespace) -> int:
     try:
         fallbacks = restore_from_state_file(args.state_file)
     except StateFileError as exc:
+        # A corrupt file names no originals, but the config names the mapped headers, so
+        # put each one still in manual mode back under firmware control.
+        if args.config:
+            try:
+                config = load_config(args.config)
+            except ConfigError as cexc:
+                _err(f"cannot restore, fans may still be in manual mode: {exc}; invalid config: {cexc}")
+                return 1
+            build_backend(config, args.state_file).recover_from_bad_state_file(exc)
+            _out(f"state file unusable ({exc}); mapped headers handed to firmware control")
+            return 0
         _err(f"cannot restore, fans may still be in manual mode: {exc}")
         return 1
     if fallbacks:

@@ -141,3 +141,18 @@ def test_healthy_idle_fan_and_min_rpm_zero_are_not_slow():
     free = HeaderSafety(replace(HEADER, min_rpm=0), 30.0, True)
     for t in range(0, 100, 5):
         assert step(free, t, rpm=50.0, commanded=20.0) == ACTIVE
+
+
+def test_repeated_failsafe_write_failure_audits_once(tmp_path, caplog):
+    class Failing(FakeBackend):
+        def write_duty(self, header_id, duty):
+            if duty == 100.0:
+                raise OSError(5, "Input/output error")
+            super().write_duty(header_id, duty)
+
+    ctl, cycle = make_controller(tmp_path, Failing())
+    cycle(50.0)
+    with caplog.at_level("ERROR", logger="thermalctl.audit"):
+        for _ in range(4):
+            cycle(120.0)
+    assert len([r for r in caplog.records if r.name == "thermalctl.audit" and "failsafe write failed" in r.getMessage()]) == 1

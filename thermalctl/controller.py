@@ -121,6 +121,8 @@ class Controller:
         overrides_report: OverrideReport | None = None,
     ) -> None:
         self.backend = backend
+        # Headers whose failsafe write failed and was already audited; cleared on success.
+        self._write_failed: set[str] = set()
         self.status_path = Path(status_path)
         self.clock = clock
         self.hold_s = hold_s
@@ -386,6 +388,7 @@ class Controller:
                     # can ignore pwm writes, so take manual mode back before full speed.
                     self.backend.retake(header.id)
                     self.backend.write_duty(header.id, duty)
+                self._write_failed.discard(header.id)
             except Exception:
                 log.exception("failsafe write failed for %s", header.id)
                 self._hand_to_firmware(header)
@@ -398,9 +401,15 @@ class Controller:
         status file and the audit log report that full speed was not written, and never
         claim a duty the fan does not have.
         """
-        audit.error(
-            "header %s failsafe write failed, handing the header to firmware control", header.id
-        )
+        if header.id not in self._write_failed:
+            # One line per episode, not per cycle, so a stuck header cannot flood the log.
+            self._write_failed.add(header.id)
+            audit.error(
+                "header %s failsafe write failed (duty was %s, wanted 100): handing the "
+                "header to firmware control (mode 1 to its recorded original, or 5 if that "
+                "is manual)",
+                header.id, self.duty.get(header.id),
+            )
         try:
             self.backend.release(header.id)
         except Exception:
