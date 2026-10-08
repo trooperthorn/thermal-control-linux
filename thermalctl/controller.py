@@ -405,9 +405,9 @@ class Controller:
             # One line per episode, not per cycle, so a stuck header cannot flood the log.
             self._write_failed.add(header.id)
             audit.error(
-                "header %s failsafe write failed (duty was %s, wanted 100): handing the "
-                "header to firmware control (mode 1 to its recorded original, or 5 if that "
-                "is manual)",
+                "header %s failsafe write failed (duty was %s): handing the header back to "
+                "the chip; the mode written and any failure to write it are audited by the "
+                "backend",
                 header.id, self.duty.get(header.id),
             )
         try:

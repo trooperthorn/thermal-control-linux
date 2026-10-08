@@ -27,8 +27,9 @@ audit = logging.getLogger("thermalctl.audit")
 MANUAL = 1
 FULL_PWM = 255
 # The pwmN_enable value written when a state file cannot say what the original was. 5 is
-# the value MediaIn-SVR reports for the chip's own control (UNVERIFIED.md), and a chip in
-# that mode cannot hold a stale low duty.
+# the value MediaIn-SVR reports for the chip's own control (UNVERIFIED.md). Whether a chip
+# in that mode can hold a stale low duty is not measured, so every path that writes it
+# writes full speed first where it can.
 FIRMWARE_MODE = 5
 
 
@@ -53,7 +54,10 @@ def _read_text(path: str) -> str:
 
 
 def _write_int(path: str, value: int) -> None:
-    with open(path, "w", encoding="ascii", newline="\n") as handle:
+    # No O_CREAT: a path that does not exist (for example an unresolved chip reference)
+    # must fail, never create a stray file that looks like a successful write.
+    fd = os.open(path, os.O_WRONLY | os.O_TRUNC)
+    with os.fdopen(fd, "w", encoding="ascii", newline="\n") as handle:
         handle.write(f"{value}\n")
 
 
@@ -160,7 +164,7 @@ class SysfsBackend:
                 audit.info("header %s left in mode %s: not in manual mode", header_id, old)
                 continue
             full_speed = False
-            if old == MANUAL:
+            if old is None or old == MANUAL:
                 try:
                     _write_int(pwm, FULL_PWM)
                     full_speed = True
@@ -190,9 +194,12 @@ class SysfsBackend:
             log.error("cannot set aside state file %s: %s", self.state_file, err)
 
     def recover_from_bad_state_file(self, exc: StateFileError) -> None:
-        """Public entry for the restore command, which has no running service."""
-        if self.active:
-            self._recover_from_bad_state_file(exc)
+        """Public entry for the restore command, which has no running service.
+
+        Not gated on the active flag: the config may have been switched away from active
+        after a run that left fans in manual mode, and restore must still make them safe.
+        """
+        self._recover_from_bad_state_file(exc)
 
     def restore(self) -> None:
         """Write full speed, then restore every recorded pwmN_enable.
@@ -319,8 +326,11 @@ class SysfsBackend:
         """Write manual mode again after a foreign change, so duty writes take effect."""
         if not self._controlled(header_id):
             return
+        previous = self.expected.get(header_id)
         _write_int(_enable_path(self.headers[header_id]), MANUAL)
         self.expected[header_id] = MANUAL
+        if previous != MANUAL:
+            audit.warning("header %s mode %s to %s (retaken)", header_id, previous, MANUAL)
 
     def release(self, header_id: str) -> None:
         """Hand one header back to its original mode, or full speed if that fails."""
@@ -336,11 +346,15 @@ class SysfsBackend:
             except OSError as exc:
                 log.error("full speed write to %s failed: %s; trying firmware mode", header_id, exc)
                 target = FIRMWARE_MODE
+        previous = self.expected.get(header_id)
         try:
             _write_int(_enable_path(pwm), target)
             self.expected[header_id] = target
+            if previous != target:
+                audit.warning("header %s mode %s to %s (released)", header_id, previous, target)
         except OSError as exc:
             log.error("release of %s failed (%s); writing full speed", header_id, exc)
+            audit.error("header %s release to mode %s failed: %s", header_id, target, exc)
             try:
                 _write_int(pwm, FULL_PWM)
             except OSError as exc2:

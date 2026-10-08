@@ -118,8 +118,10 @@ trips fail-safe after the same window (`slow_fan`), unless `min_rpm` is 0.
 
 If the full speed write fails during fail-safe, the header is handed back to firmware
 control and the status file reports the note `failsafe_write_failed`. If the state file
-from a killed run is corrupt, the service puts every mapped header under firmware control,
-keeps the bad file as `state.json.bad`, and starts.
+from a killed run is corrupt, the service writes full speed and then firmware mode to each
+mapped header that is in manual mode or whose mode cannot be read, leaves headers in any
+other mode alone, keeps the bad file as `state.json.bad` (or `state.json.bad.N` when one is
+already kept), and starts. `thermalctl restore --config` does the same without starting.
 
 ## hostwatch integration
 

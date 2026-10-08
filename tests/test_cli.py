@@ -774,3 +774,46 @@ def test_recommend_min_duty():
     assert recommend_min_duty(20, 40) == 50
     assert recommend_min_duty(30, 30) == 45
     assert recommend_min_duty(20, None) == 100
+
+
+def test_restore_with_config_resolves_chip_references_and_creates_no_stray_file(tmp_path, monkeypatch):
+    root = make_hwmon_root(tmp_path, {"hwmon0": ("nct6779", 5), "hwmon3": ("coretemp", 0)})
+    (root / "hwmon0" / "pwm2_enable").write_text("1\n")
+    (root / "hwmon0" / "pwm2").write_text("30\n")
+    config = write_named_config(tmp_path)
+    state = tmp_path / "state.json"
+    state.write_text("{bad", encoding="utf-8")
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    argv = ["restore", "--state-file", str(state), "--force", "--config", str(config),
+            "--hwmon-root", str(root)]
+    assert main(argv) == 0
+    assert (root / "hwmon0" / "pwm2").read_text() == "255\n"
+    assert (root / "hwmon0" / "pwm2_enable").read_text() == "5\n"
+    assert list(cwd.iterdir()) == []
+    assert (tmp_path / "state.json.bad").exists()
+
+
+def test_restore_with_unresolvable_chip_reference_fails_and_keeps_the_evidence(tmp_path, monkeypatch, capsys):
+    root = make_hwmon_root(tmp_path, {"hwmon3": ("coretemp", 0)})
+    config = write_named_config(tmp_path)
+    state = tmp_path / "state.json"
+    state.write_text("{bad", encoding="utf-8")
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    argv = ["restore", "--state-file", str(state), "--force", "--config", str(config),
+            "--hwmon-root", str(root)]
+    assert main(argv) == 1
+    assert "manual mode" in capsys.readouterr().err
+    assert state.exists() and list(cwd.iterdir()) == []
+
+
+def test_restore_with_config_not_in_active_mode_still_makes_manual_headers_safe(tmp_path):
+    tree, _config, state = killed_service_state(tmp_path)
+    dry = write_config(tmp_path, tree, mode="dry_run")
+    state.write_text("{bad", encoding="utf-8")
+    assert main(["restore", "--state-file", str(state), "--force", "--config", str(dry)]) == 0
+    assert (tree / "pwm1_enable").read_text() == "5\n"
+    assert (tree / "pwm1").read_text() == "255\n"

@@ -72,6 +72,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="config file; lets restore find the mapped headers when the state file is corrupt",
     )
     restore.add_argument("--lock-file", default=None, help="ownership lock (default: beside the state file)")
+    restore.add_argument("--hwmon-root", default=DEFAULT_HWMON_ROOT, help=argparse.SUPPRESS)
     restore.add_argument(
         "--force",
         action="store_true",
@@ -310,6 +311,13 @@ def cmd_restore(args: argparse.Namespace) -> int:
                 config = load_config(args.config)
             except ConfigError as cexc:
                 _err(f"cannot restore, fans may still be in manual mode: {exc}; invalid config: {cexc}")
+                return 1
+            # Chip references must become real paths, or the backend would open them as
+            # file names and report a handover that never reached the fan.
+            try:
+                config = resolve_config(config, args.hwmon_root)
+            except HwmonError as hexc:
+                _err(f"cannot restore, fans may still be in manual mode: {exc}; {hexc}")
                 return 1
             build_backend(config, args.state_file).recover_from_bad_state_file(exc)
             _out(f"state file unusable ({exc}); mapped headers handed to firmware control")

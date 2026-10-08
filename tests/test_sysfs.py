@@ -5,6 +5,7 @@ import signal
 import pytest
 
 from thermalctl.backends.sysfs import (
+    _write_int,
     BackendError,
     StateFileError,
     SysfsBackend,
@@ -397,3 +398,30 @@ def test_release_of_manual_original_writes_full_speed_then_firmware_if_that_fail
     break_file(tree / "pwm1")
     b.release("p1")
     assert text(tree / "pwm1_enable") == "5"
+
+
+def test_corrupt_state_recovery_writes_full_speed_first_when_the_mode_is_unreadable(tree, tmp_path):
+    (tree / "pwm1_enable").write_text("garbage\n")
+    put(tree / "pwm1", "30\n")
+    (tmp_path / "state.json").write_text("{bad", encoding="utf-8")
+    make(tree, tmp_path, mapped=("p1",)).recover_from_bad_state_file(StateFileError("test"))
+    assert text(tree / "pwm1") == "255" and text(tree / "pwm1_enable") == "5"
+
+
+def test_write_int_never_creates_a_missing_file(tmp_path):
+    missing = tmp_path / "unresolved_pwm1_enable"
+    with pytest.raises(OSError):
+        _write_int(str(missing), 5)
+    assert not missing.exists()
+
+
+def test_release_and_retake_audit_each_mode_change(tree, tmp_path, caplog):
+    put(tree / "pwm1_enable", "2\n")
+    b = make(tree, tmp_path, mapped=("p1",))
+    b.start()
+    with caplog.at_level("INFO", logger="thermalctl.audit"):
+        b.release("p1")
+        b.release("p1")
+        b.retake("p1")
+    msgs = [r.getMessage() for r in caplog.records]
+    assert msgs == ["header p1 mode 1 to 2 (released)", "header p1 mode 2 to 1 (retaken)"]
