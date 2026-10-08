@@ -40,6 +40,9 @@ EXTERNAL_CHANGE = "external_change"
 # verification read says, so any drift the read cannot see is corrected. 60 cycles is two
 # minutes at the default 2 second interval.
 FORCE_REFRESH_CYCLES = 60
+# How far the wall clock may drift from the monotonic clock, in seconds, before an override
+# with an expiry is dropped as untrustworthy. Ordinary oscillator drift is a few seconds a day.
+CLOCK_STEP_TOLERANCE_S = 60.0
 # Marks a header handed to firmware control in the applied-state table, which has no duty.
 _RELEASED = -1
 
@@ -132,7 +135,7 @@ def describe_changes(old: Config | None, new: Config) -> list[str]:
     header_fields = ("mapped", "path", "min_duty", "min_rpm", "stall_window_s", "zones", "min_rpm_duty")
     zone_fields = (
         "temperature_input", "temperature_curve", "hard_max_temp_c",
-        "stale_after_s", "load_input", "load_curve",
+        "stale_after_s", "frozen_after_s", "load_input", "load_curve",
     )
     for kind, olds, news, fields in (
         ("header", old.headers, new.headers, header_fields),
@@ -224,11 +227,19 @@ class Controller:
         self.overrides_mode = report.mode
         # Why the last overrides reload was rejected or ignored; None when all is well.
         self.overrides_error: str | None = report.ignored
-        # The active override and when it ends, in wall clock epoch seconds. The expiry is an
-        # absolute time, so it is compared with the wall clock, not the monotonic timer clock.
+        # The active override and when it ends, in wall clock epoch seconds. The file names an
+        # absolute time, but the controller also tracks a monotonic deadline from the moment
+        # it first saw that expiry, and ends the override at whichever comes first. A wall
+        # clock stepped backwards therefore cannot extend a lowered floor.
         self._expiry_tried: float | None = None
+        # (expires_at, monotonic deadline, wall time and monotonic time when first seen).
+        self._expiry_track: tuple[float, float, float, float] | None = None
+        # Expiries that have ended. A reload never applies an override with one of these, so
+        # a wall clock that reads earlier than the deadline cannot bring the override back.
+        self._ended_expiries: set[float] = set()
         self.override_active = report.active
         self.override_expires_at: float | None = report.expires_at if report.applied else None
+        self._track_expiry()
         self._stamps = self._stat_files()
         self.config_valid = True
         self.config = config
@@ -425,6 +436,12 @@ class Controller:
         try:
             if use_overrides:
                 new, report = apply_overrides(new, self.overrides_path, self.wall_clock())
+                if report.applied and report.expires_at in self._ended_expiries:
+                    # This override already ended on the monotonic deadline (or on a doubt
+                    # about the clock); the wall clock must not bring it back.
+                    new, report = apply_overrides(
+                        base, self.overrides_path, report.expires_at
+                    )
             else:
                 report = OverrideReport(str(self.overrides_path or DEFAULT_OVERRIDES_PATH))
         except Exception as exc:
@@ -467,6 +484,7 @@ class Controller:
             )
         self.override_active = report.active
         self.override_expires_at = report.expires_at if report.applied else None
+        self._track_expiry()
         return True
 
     def _stat_files(self) -> tuple[tuple[int, int] | None, tuple[int, int] | None]:
@@ -489,6 +507,8 @@ class Controller:
             return
         stamps = self._stat_files()
         expired = self._override_expired()
+        if expired and self.override_expires_at is not None:
+            self._ended_expiries.add(self.override_expires_at)
         if not self.reload_requested and not expired and stamps == self._stamps:
             return
         self.reload_requested = False
@@ -518,12 +538,34 @@ class Controller:
                 if not done:
                     self._expiry_tried = None
 
+    def _track_expiry(self) -> None:
+        """Start a monotonic deadline for the active override's expiry, once per expiry."""
+        expires_at = self.override_expires_at
+        if expires_at is None:
+            self._expiry_track = None
+            return
+        if self._expiry_track is not None and self._expiry_track[0] == expires_at:
+            return
+        wall = self.wall_clock()
+        mono = self.clock()
+        self._expiry_track = (expires_at, mono + (expires_at - wall), wall, mono)
+
     def _override_expired(self) -> bool:
-        return (
-            self.override_expires_at is not None
-            and self.override_expires_at != self._expiry_tried
-            and self.wall_clock() >= self.override_expires_at
-        )
+        """True when the active override must end now: any clock says so, or any doubt."""
+        expires_at = self.override_expires_at
+        if expires_at is None or expires_at == self._expiry_tried:
+            return False
+        if expires_at in self._ended_expiries:
+            return True
+        self._track_expiry()
+        track = self._expiry_track
+        wall = self.wall_clock()
+        mono = self.clock()
+        if wall >= expires_at or track is None or mono >= track[1]:
+            return True
+        # The wall clock moved by a very different amount than the monotonic clock since the
+        # expiry was first seen, so the wall time cannot be trusted. Revert to the base config.
+        return abs((wall - track[2]) - (mono - track[3])) > CLOCK_STEP_TOLERANCE_S
 
     # -- one cycle ----------------------------------------------------------------
 

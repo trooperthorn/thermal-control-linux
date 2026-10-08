@@ -22,6 +22,7 @@ FAILSAFE = "failsafe"
 MISSING_INPUT = "missing_input"
 INVALID_INPUT = "invalid_input"
 STALE_INPUT = "stale_input"
+FROZEN_INPUT = "frozen_input"
 OVER_TEMP = "over_temp"
 STALL = "stall"
 LOW_RPM = "low_rpm"
@@ -45,6 +46,9 @@ class Reading:
     timestamp: float | None
     # True only for a load reading that has no delta yet, so it is not a fault.
     warming_up: bool = False
+    # The time the value last differed from the one before, on the same clock. Only a sensor
+    # reader that tracks changes sets it; None means the frozen-sensor rule does not apply.
+    unchanged_since: float | None = None
 
 
 def _number_ok(value: object) -> bool:
@@ -62,6 +66,7 @@ def _check_reading(
     stale_after_s: float,
     plausible: tuple[float, float],
     reject_zero: bool = False,
+    frozen_after_s: float | None = None,
 ) -> list[str]:
     if reading is not None and reading.warming_up and reading.value is None:
         return []
@@ -79,6 +84,15 @@ def _check_reading(
     # A timestamp in the future means the clock or the reader is wrong, so it counts as stale.
     if age < 0 or age > stale_after_s:
         return [f"{STALE_INPUT}:{name}"]
+    # The read is fresh, but a value that has not changed for a much longer time means the
+    # chip stopped updating while the file still answers. That is separate from stale_after_s,
+    # because a quiet host can hold one reading for minutes.
+    since = reading.unchanged_since
+    if frozen_after_s is not None and since is not None:
+        if not _number_ok(since):
+            return [f"{INVALID_INPUT}:{name}"]
+        if now - since > frozen_after_s:
+            return [f"{FROZEN_INPUT}:{name}"]
     return []
 
 
@@ -96,6 +110,7 @@ def input_causes(
             zone.stale_after_s,
             (zone.plausible_min_c, zone.plausible_max_c),
             reject_zero=True,
+            frozen_after_s=zone.frozen_after_s,
         )
         causes += found
         if not found and temp.value > zone.hard_max_temp_c:

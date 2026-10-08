@@ -175,3 +175,18 @@ def test_misspelled_chip_reference_is_rejected():
     data = mutated(lambda d: d["headers"][0].update(path="nct6779:fan2"))
     with pytest.raises(ConfigError):
         parse_config(data)
+
+
+def test_frozen_after_s_defaults_to_fifteen_minutes_and_is_validated():
+    assert parse_config(GOOD).zones[0].frozen_after_s == 900.0
+    ok = mutated(lambda d: d["zones"][0].update(frozen_after_s=1800))
+    assert parse_config(ok).zones[0].frozen_after_s == 1800.0
+    for bad in (0, -1, 5, "x", True, float("nan")):
+        data = mutated(lambda d, bad=bad: d["zones"][0].update(frozen_after_s=bad))
+        with pytest.raises(ConfigError):
+            parse_config(data)
+
+
+def test_example_sets_a_frozen_limit_far_above_stale_after_s():
+    zone = load_config(EXAMPLE).zones[0]
+    assert zone.frozen_after_s >= 900.0 and zone.frozen_after_s > 10 * zone.stale_after_s

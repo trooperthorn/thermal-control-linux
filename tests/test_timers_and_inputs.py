@@ -145,27 +145,80 @@ def _sysfs_rig(tmp_path):
     return tree, now, backend, ctl
 
 
-def test_reading_is_stamped_with_the_time_the_value_last_changed(tmp_path):
+def test_reading_is_stamped_with_the_read_time_and_the_last_change(tmp_path):
     tree, now, backend, _ = _sysfs_rig(tmp_path)
     sensor = str(tree / "temp1_input")
-    assert backend.read_inputs()[sensor] == Reading(45.5, 500.0)
+    assert backend.read_inputs()[sensor] == Reading(45.5, 500.0, unchanged_since=500.0)
     now["t"] = 530.0
-    assert backend.read_inputs()[sensor] == Reading(45.5, 500.0)
+    assert backend.read_inputs()[sensor] == Reading(45.5, 530.0, unchanged_since=500.0)
     put(tree / "temp1_input", "46000\n")
-    assert backend.read_inputs()[sensor] == Reading(46.0, 530.0)
+    assert backend.read_inputs()[sensor] == Reading(46.0, 530.0, unchanged_since=530.0)
 
 
-def test_frozen_sensor_trips_stale_after(tmp_path):
+def test_frozen_sensor_trips_after_frozen_after_s_not_stale_after_s(tmp_path):
     tree, now, _, ctl = _sysfs_rig(tmp_path)
+    frozen_after = int(ctl.config.zones[0].frozen_after_s)
+    assert frozen_after == 900 and ctl.config.zones[0].stale_after_s == 10
     assert ctl.cycle()["headers"]["p1"]["state"] == "dry_run"
     states = []
-    for _ in range(14):    # the value never changes; stale_after_s is 10
+    for _ in range(frozen_after + 5):    # the value never changes
         now["t"] += 1.0
         doc = ctl.cycle()
         states.append(doc["headers"]["p1"]["state"])
-    assert states[:9] == ["dry_run"] * 9
+    # Far past stale_after_s the value is still trusted; only frozen_after_s trips it.
+    assert states[:frozen_after] == ["dry_run"] * frozen_after
     assert states[-1] == "failsafe"
-    assert any(r.startswith("stale_input:") for r in doc["headers"]["p1"]["reasons"])
+    assert any(r.startswith("frozen_input:") for r in doc["headers"]["p1"]["reasons"])
+
+
+def test_sensor_stuck_for_frozen_after_s_trips(tmp_path):
+    tree, now, _, ctl = _sysfs_rig(tmp_path)
+    ctl.cycle()
+    now["t"] += 899.0
+    assert ctl.cycle()["headers"]["p1"]["state"] == "dry_run"
+    now["t"] += 2.0
+    doc = ctl.cycle()
+    assert doc["headers"]["p1"]["state"] == "failsafe"
+    assert doc["headers"]["p1"]["reasons"] == ["frozen_input:" + str(tree / "temp1_input")]
+
+
+def test_one_degree_sensor_stepping_every_30s_stays_on_the_example_curve(tmp_path):
+    import tomllib
+
+    from test_config import EXAMPLE
+
+    raw = tomllib.loads(EXAMPLE.read_text(encoding="utf-8"))
+    tree = make_tree(tmp_path)
+    sensor = str(tree / "temp1_input")
+    zone = dict(raw["zones"][0], temperature_input=sensor)
+    zone.pop("load_input")
+    zone.pop("load_curve")
+    now = {"t": 500.0}
+    backend = SysfsBackend(
+        {"p1": str(tree / "pwm1")}, {sensor: sensor}, [], tmp_path / "state.json",
+        clock=lambda: now["t"],
+    )
+    config = parse_config({
+        "mode": "dry_run", "zones": [zone],
+        "headers": [dict(HEADER, id="p1", path=str(tree / "pwm1"), mapped=False)],
+    })
+    ctl = Controller(config, backend, status_path=tmp_path / "status.json",
+                     clock=lambda: now["t"])
+    for i in range(1800):
+        now["t"] += 1.0
+        if i % 30 == 0:
+            put(tree / "temp1_input", f"{45000 + 1000 * ((i // 30) % 2)}\n")
+        doc = ctl.cycle()
+        assert doc["headers"]["p1"]["state"] == "dry_run", (i, doc["headers"]["p1"]["reasons"])
+
+
+def test_reader_that_stops_reading_is_still_stale(tmp_path):
+    rig = Rig(tmp_path)
+    rig.cycle()
+    rig.mono += 11.0
+    rig.backend.inputs = {"temp": Reading(50.0, rig.mono - 11.0)}
+    doc = rig.ctl.cycle()
+    assert any(r.startswith("stale_input:") for r in doc["headers"]["pwm1"]["reasons"])
 
 
 def test_sensor_that_keeps_changing_never_goes_stale(tmp_path):
@@ -184,7 +237,7 @@ def test_unreadable_sensor_forgets_its_history(tmp_path):
     assert backend.read_inputs()[sensor] == Reading(None, None)
     put(tree / "temp1_input", "45500\n")
     now["t"] = 900.0
-    assert backend.read_inputs()[sensor] == Reading(45.5, 900.0)
+    assert backend.read_inputs()[sensor] == Reading(45.5, 900.0, unchanged_since=900.0)
 
 
 # -- /proc/stat counter resets ------------------------------------------------------------

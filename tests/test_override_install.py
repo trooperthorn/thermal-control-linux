@@ -13,10 +13,13 @@ import pytest
 from test_overrides_reload import MAIN, Rig, put, trusted  # noqa: F401
 
 from thermalctl import config as config_module
+from thermalctl.backend import FakeBackend
 from thermalctl import install as install_module
 from thermalctl.__main__ import main
 from thermalctl.config import ConfigError, apply_overrides, load_config
+from thermalctl.controller import Controller
 from thermalctl.install import InstallError, install_override
+from thermalctl.safety import Reading
 
 ROOT = Path(__file__).resolve().parent.parent
 LIVE = "[headers.pwm1]\nmin_duty = 25\n"
@@ -531,3 +534,72 @@ def test_unit_has_hardening_that_leaves_sysfs_writable():
 def test_unit_hardening_is_listed_as_unverified():
     text = (ROOT / "UNVERIFIED.md").read_text(encoding="utf-8")
     assert "NoNewPrivileges=yes" in text and "install-override" in text
+
+
+class SplitClockRig:
+    """A controller whose wall clock and monotonic clock are moved independently."""
+
+    def __init__(self, tmp_path, overrides_text):
+        self.mono = 5000.0
+        self.wall = 1000.0
+        self.main = tmp_path / "config.toml"
+        self.over = tmp_path / "overrides.toml"
+        self.status = tmp_path / "status.json"
+        put(self.main, MAIN)
+        put(self.over, overrides_text)
+        config, report = config_module.load_effective(self.main, self.over, now=self.wall)
+        self.backend = FakeBackend()
+        self.backend.rpms = {"pwm1": 900.0}
+        self.ctl = Controller(
+            config, self.backend, status_path=self.status, clock=lambda: self.mono,
+            wall_clock=lambda: self.wall, hold_s=5.0, ema_alpha=1.0, ramp_down_per_s=2.0,
+            overrides_path=self.over, config_path=self.main, overrides_report=report,
+        )
+
+    def cycle(self, advance=1.0, wall_step=0.0):
+        self.mono += advance
+        self.wall += advance + wall_step
+        self.backend.inputs = {"temp": Reading(30.0, self.mono)}
+        self.ctl.cycle()
+        return json.loads(self.status.read_text(encoding="utf-8"))
+
+
+def test_backward_wall_step_does_not_extend_a_lowered_override(tmp_path):
+    rig = SplitClockRig(tmp_path, "expires_at = 1010\n[headers.pwm1]\nmin_duty = 20\n")
+    assert rig.cycle()["headers"]["pwm1"]["min_duty"] == 20
+    # The wall clock jumps back 30 s, inside the drift tolerance. By wall time the override
+    # now has about 40 s left, but only 10 s were granted from install.
+    doc = rig.cycle(wall_step=-30.0)
+    assert 1010.0 - rig.wall > 30.0
+    assert doc["override_active"] is True
+    ended = None
+    for _ in range(15):
+        doc = rig.cycle()
+        if not doc["override_active"]:
+            ended = rig.mono
+            break
+    # Monotonic time since install passed the 10 s the file allowed, so it ended on time.
+    assert ended is not None and ended - 5000.0 <= 12.0
+    assert doc["headers"]["pwm1"]["min_duty"] == 40
+    # A reload under the stepped-back wall clock must not bring the override back.
+    rig.ctl.request_reload()
+    doc = rig.cycle()
+    assert doc["override_active"] is False and doc["headers"]["pwm1"]["min_duty"] == 40
+    put(rig.over, "expires_at = 1010\n[headers.pwm1]\nmin_duty = 22\n")
+    rig.ctl.request_reload()
+    assert rig.cycle()["headers"]["pwm1"]["min_duty"] == 40
+
+
+def test_wall_clock_far_from_monotonic_time_reverts_to_the_base_config(tmp_path):
+    rig = SplitClockRig(tmp_path, "expires_at = 100000\n[headers.pwm1]\nmin_duty = 20\n")
+    assert rig.cycle()["headers"]["pwm1"]["min_duty"] == 20
+    doc = rig.cycle(wall_step=-500.0)
+    assert doc["override_active"] is False
+    assert doc["headers"]["pwm1"]["min_duty"] == 40
+
+
+def test_forward_wall_step_still_ends_an_override_early(tmp_path):
+    rig = SplitClockRig(tmp_path, "expires_at = 1010\n[headers.pwm1]\nmin_duty = 20\n")
+    rig.cycle()
+    doc = rig.cycle(wall_step=100.0)
+    assert doc["override_active"] is False and doc["headers"]["pwm1"]["min_duty"] == 40

@@ -292,12 +292,12 @@ class SysfsBackend:
     def read_inputs(self) -> Mapping[str, Reading]:
         """Return a reading per input; an unreadable input has value None.
 
-        A reading is stamped with the time its value last changed, not the time it was read.
-        A sensor whose chip has stopped updating keeps returning the same number, and a
-        stamp of the read time would make that look fresh for ever. So a value that has not
-        changed for stale_after_s counts as stale (the frozen-sensor rule). A sensor that
-        legitimately holds one value for longer than stale_after_s is therefore treated as
-        failed, which is the safe direction: pick a stale_after_s longer than that.
+        A reading is stamped with the time it was read, and also carries the time its value
+        last changed (unchanged_since). A sensor whose chip has stopped updating keeps
+        returning the same number, so a read time alone would look fresh for ever. The safety
+        check treats a value unchanged for frozen_after_s as frozen (the frozen-sensor rule).
+        That limit is separate from, and much longer than, stale_after_s, because a quiet
+        host legitimately holds one reading for minutes.
         """
         now = self.clock()
         result: dict[str, Reading] = {}
@@ -313,7 +313,7 @@ class SysfsBackend:
             if seen is None or seen[0] != value:
                 seen = (value, now)
                 self._changed[name] = seen
-            result[name] = Reading(value, seen[1])
+            result[name] = Reading(value, now, unchanged_since=seen[1])
         return result
 
     def read_rpm(self, header_id: str) -> float | None:

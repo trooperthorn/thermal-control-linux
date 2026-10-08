@@ -23,6 +23,9 @@ MODES = ("dry_run", "active")
 TEMP_RANGE = (-50.0, 150.0)
 LOAD_RANGE = (0.0, 100.0)
 DEFAULT_PLAUSIBLE_TEMP = (-20.0, 150.0)
+# 15 minutes. A 1 C sensor on an idle host can hold one reading for many minutes, and only a
+# value unchanged for much longer is taken as a chip that stopped updating. See UNVERIFIED.md.
+DEFAULT_FROZEN_AFTER_S = 900.0
 # A chip reference such as nct6779:pwm2, resolved to the current hwmonN at start.
 CHIP_REF = re.compile(r"^(?P<chip>[A-Za-z0-9_.-]+):(?P<file>(?:pwm\d+|temp\d+_input))$")
 
@@ -42,6 +45,9 @@ class Zone:
     load_curve: tuple[Point, ...] | None = None
     plausible_min_c: float = DEFAULT_PLAUSIBLE_TEMP[0]
     plausible_max_c: float = DEFAULT_PLAUSIBLE_TEMP[1]
+    # How long a value may stay exactly the same before the sensor counts as frozen. It is
+    # separate from stale_after_s: a quiet host legitimately holds one reading for minutes.
+    frozen_after_s: float = DEFAULT_FROZEN_AFTER_S
 
 
 @dataclass(frozen=True)
@@ -143,6 +149,14 @@ def _zone(table: object, index: int) -> Zone:
     plausible_max = _number(
         table.get("plausible_max_c", DEFAULT_PLAUSIBLE_TEMP[1]), f"{where}: plausible_max_c"
     )
+    stale_after = _positive(table, "stale_after_s", where)
+    frozen_after = (
+        _positive(table, "frozen_after_s", where)
+        if "frozen_after_s" in table
+        else max(DEFAULT_FROZEN_AFTER_S, stale_after)
+    )
+    if frozen_after < stale_after:
+        raise ConfigError(f"{where}: frozen_after_s must not be below stale_after_s")
     if plausible_min >= plausible_max:
         raise ConfigError(f"{where}: plausible_min_c must be below plausible_max_c")
     if hard_max > plausible_max:
@@ -159,13 +173,14 @@ def _zone(table: object, index: int) -> Zone:
         temperature_input=_string(table, "temperature_input", where),
         temperature_curve=temperature_curve,
         hard_max_temp_c=hard_max,
-        stale_after_s=_positive(table, "stale_after_s", where),
+        stale_after_s=stale_after,
         load_input=load_input,
         load_curve=None
         if load_raw is None
         else _curve(load_raw, f"{where} load_curve", LOAD_RANGE),
         plausible_min_c=plausible_min,
         plausible_max_c=plausible_max,
+        frozen_after_s=frozen_after,
     )
 
 

@@ -11,7 +11,7 @@ measured are listed in `UNVERIFIED.md`.
 - `thermalctl run --config PATH` runs the control loop. It is a dry run unless the config
   says `mode = "active"`, and even then it writes only to headers marked `mapped = true`.
 - `thermalctl run` and `check-config` also read an optional overrides file, `/etc/thermalctl/overrides.toml` by default or `--overrides PATH`. See the overrides section below.
-- `thermalctl run --interval` must be a finite number from 0.05 to 300 seconds. Two headers may not use the same pwm file. A sensor whose value does not change for `stale_after_s` is treated as stale and sends its headers to full speed, so choose a `stale_after_s` longer than the longest time your sensor holds one reading.
+- `thermalctl run --interval` must be a finite number from 0.05 to 300 seconds. Two headers may not use the same pwm file. A reading older than `stale_after_s` is stale, and a sensor whose value has not changed for `frozen_after_s` (default 900 seconds) is frozen; either sends its headers to full speed. The two limits are separate so a quiet host whose sensor holds one reading for minutes stays on its curve.
 - `thermalctl status` prints the status file the service writes: each zone's temperature and CPU load, then each header's state, duty, RPM and reasons. `--json` prints it raw.
   It exits non-zero when the file is missing or older than `--max-age` seconds.
 - `thermalctl check-config PATH` validates a config file and changes nothing. It rejects curves whose duty falls as the input rises and temperature curves that do not reach 100 percent at or below `hard_max_temp_c`.
@@ -103,7 +103,10 @@ An overrides file may also set a top-level `expires_at`, either a TOML datetime 
 offset (`2026-10-08T06:00:00Z`) or epoch seconds. From that time the service ignores the
 file and runs on the base config again, with an audit line that names the override that
 ended; the file itself is left in place. `expires_at` cannot be combined with `mode`,
-because a mode change needs a restart and so could not be reverted on time. Floors may be
+because a mode change needs a restart and so could not be reverted on time. The service also
+tracks a monotonic deadline from when it first sees the expiry, so a wall clock stepped
+backwards cannot extend a lowered floor, and it drops the override if the wall clock and
+monotonic clock disagree by more than a minute. Floors may be
 fractions such as `min_duty = 22.5`. `thermalctl status` shows `override active` with its
 expiry, and the status file carries `override_active` and `override_expires_at` (wall
 clock epoch seconds, or `null`).

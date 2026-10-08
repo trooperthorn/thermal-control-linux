@@ -31,9 +31,13 @@ temperature_curve = [[40, 20], [55, 35], [70, 70], [80, 100]]
 # Points are [load percent, duty percent]. Load can raise the duty, never lower it.
 load_curve = [[0, 0], [50, 30], [90, 100]]
 hard_max_temp_c = 90
-# A sensor whose value does not change for this long counts as stale and sends the fans to
-# full speed. Raise it if the real sensor can hold one reading for longer.
+# A reading older than this many seconds (the sensor could not be read in time) counts as
+# stale and sends the fans to full speed.
 stale_after_s = 10
+# A sensor whose value has not changed for this long counts as frozen and also sends the
+# fans to full speed. It is far longer than stale_after_s because a quiet host can hold one
+# reading for minutes. 900 seconds (15 minutes) is the default; its basis is in UNVERIFIED.md.
+frozen_after_s = 900
 
 [[headers]]
 id = "pwm1"

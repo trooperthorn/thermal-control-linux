@@ -112,7 +112,8 @@ problem, which the controller treats as a fail-safe cause. The top level holds `
 
 - A zone has `id`, `temperature_input`, `temperature_curve`, `hard_max_temp_c`,
   `stale_after_s`, and optionally `load_input` with `load_curve`, which must be given
-  together.
+  together, and `frozen_after_s` (default 900, never below `stale_after_s`), how long a
+  sensor value may stay exactly the same before the sensor counts as frozen.
 - A header has `id`, `path`, `mapped` (default false), `min_duty`, `min_rpm`,
   `stall_window_s`, `zones`, a list of zone ids that must exist, and optionally
   `min_rpm_duty` (default 50), the commanded duty from which `min_rpm` is enforced.
@@ -162,8 +163,15 @@ down at the normal rate and raising it takes effect in the same cycle.
 #### Override expiry
 
 `expires_at` (TOML datetime with offset, or epoch seconds) is parsed by `_expires_at`. It
-is an absolute time, so the controller compares it with its wall clock, not the monotonic
-timer clock; the status file already uses wall time for the same reason. `apply_overrides`
+is an absolute time, but the controller does not trust the wall clock alone. When it first
+sees an expiry (at start or on a reload) it records a monotonic deadline, the time left by
+the wall clock added to the monotonic clock, together with the wall and monotonic times of
+that moment. The override ends when either clock reaches its limit, and also on any doubt:
+if the wall clock and the monotonic clock have moved apart by more than
+`CLOCK_STEP_TOLERANCE_S` (60 seconds) since the expiry was first seen. A wall clock stepped
+backwards therefore cannot extend a lowered floor. An expiry that has ended is remembered
+(`_ended_expiries`), and a reload treats a file with that `expires_at` as expired, so the
+wall clock reading early cannot bring the override back. `apply_overrides`
 takes `now` and returns the base config with `OverrideReport.expired` set once `now` has
 reached `expires_at`. `expires_at` with `mode` is rejected, because a mode change needs a
 restart and could not be reverted. At the start of every cycle `_poll_reload` also reloads
@@ -181,8 +189,10 @@ falls back to the lower base value at expiry. `expires_at` may not lie beyond th
 so every status reader can show it. The audit log gets `override active,
 expires_at=...` when an override is active at start, `config change:` lines with the old
 and new floor, and `override ended (...): base config in use` at expiry. A wall clock
-stepped backwards extends an override until the clock catches up; stepped forwards, it
-ends one early, which is the safe side. The status file carries `override_active` and
+stepped backwards no longer extends an override, and stepped forwards ends one early, which
+is the safe side. The monotonic clock does not count time the host spends suspended, so an
+override may outlast its wall expiry across a suspend only until the wall clock check runs
+on resume, which ends it at the first cycle. The status file carries `override_active` and
 `override_expires_at`.
 
 #### Installing an override
@@ -216,7 +226,7 @@ config is valid. A header is `active` only when the config mode enables it and t
 is mapped; otherwise it is `dry_run`. Any cause moves it to `failsafe` in the same cycle,
 and the reasons are recorded as `kind:name` strings such as `stale_input:temp1`. Causes
 are: missing, non-numeric or non-finite input, a timestamp older than `stale_after_s` or
-in the future, a temperature above `hard_max_temp_c`, an unreadable RPM, 0 RPM while the
+in the future, a value unchanged for longer than `frozen_after_s` (`frozen_input:<name>`), a temperature above `hard_max_temp_c`, an unreadable RPM, 0 RPM while the
 commanded duty is above 0 (the floor included) for longer than `stall_window_s`, an RPM below
 a non-zero `min_rpm` while commanded at or above `min_rpm_duty` for longer than
 `stall_window_s` (reason `low_rpm:<id>`; `min_rpm = 0` turns this check off for fans that
@@ -298,13 +308,16 @@ readings from that clock. Only the status file uses wall time (`timestamp` and e
 header's `last_change`), because hostwatch compares them with its own wall clock; the
 controller converts a timer instant to wall time by its age when it writes the file.
 
-Frozen sensor rule. The sysfs backend stamps a temperature reading with the time its value
-last changed, not the time it was read. A sensor whose value has not changed for
-`stale_after_s` is therefore stale, which catches a chip that stopped updating but still
-returns its last number. The cost is that a sensor which legitimately holds one value for
-longer than `stale_after_s` is treated as failed and the header goes to full speed, so
-`stale_after_s` must exceed the longest steady period of the real sensor (see
-UNVERIFIED.md). The CPU load input is stamped with the time its value was last computed. If
+Frozen sensor rule. Staleness and freezing are two separate checks. The sysfs backend
+stamps a temperature reading with the time it was read, so `stale_after_s` (default in the
+example: 10 seconds) only catches a reader that stopped reading. The reading also carries
+`unchanged_since`, the time its value last differed from the one before, and a value that
+has not changed for `frozen_after_s` (default 900 seconds, 15 minutes) is frozen
+(`frozen_input:<name>`), which catches a chip that stopped updating but still returns its
+last number. The two limits are separate because a quiet host with a 1 C sensor can hold
+one reading for minutes, and tying the frozen rule to `stale_after_s` sent such a host to
+full speed. The basis for the default is in UNVERIFIED.md. The sysfs interface exposes no
+staleness flag, so no driver-reported staleness input exists yet. The CPU load input is stamped with the time its value was last computed. If
 the `/proc/stat` counters go backwards the value is dropped and the input is missing until
 a new delta exists, and if they do not move the old stamp is kept so the value ages.
 
