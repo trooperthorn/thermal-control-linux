@@ -314,11 +314,24 @@ class Controller:
         expires_at, so this does not consult the main config file when the base is known.
         """
         base = self._base_config
+        from_disk = False
         if base is None and self.config_path is not None:
             base = self._load_base(self.config_path)
+            from_disk = True
         if base is None:
             audit.error("override expired but the base config is unknown, floors stay lowered")
             return False
+        if from_disk:
+            # A config read fresh from disk is held to the same rule as a reload: a change the
+            # running backend cannot follow is never applied as a side effect of expiry.
+            blocked = self._restart_required(self.config, base)
+            if blocked:
+                audit.error(
+                    "override expired but the base config on disk needs a restart (%s), "
+                    "floors stay lowered",
+                    "; ".join(blocked),
+                )
+                return False
         audit.warning(
             "override ended (expires_at=%s expired=True): base config in use",
             self.override_expires_at,
@@ -692,6 +705,7 @@ class Controller:
             "overrides_error": self.overrides_error,
             "override_active": self.override_active,
             "override_expires_at": self.override_expires_at,
+            "overrides_mode": self.overrides_mode,
             "config_error": self.config_error,
             "zones": {
                 z.id: {

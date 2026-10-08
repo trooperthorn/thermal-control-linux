@@ -384,24 +384,31 @@ def cmd_check_config(args: argparse.Namespace) -> int:
 
 
 def _when(epoch: float) -> str:
-    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (OverflowError, OSError, ValueError):
+        # Display must never fail: a time that cannot be shown is still shown as seconds.
+        return f"epoch {epoch:g}"
 
 
-def _running_mode(status_path: str) -> str | None:
-    """The mode the running service reports in its status file; None when unknown."""
+def _running_state(status_path: str) -> dict:
+    """The status file of the running service as a dict; empty when unreadable."""
     try:
         with open(status_path, encoding="utf-8") as handle:
-            mode = json.load(handle).get("mode")
-    except (OSError, ValueError, AttributeError):
-        return None
-    return mode if mode in ("active", "dry_run") else None
+            doc = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return doc if isinstance(doc, dict) else {}
 
 
 def cmd_install_override(args: argparse.Namespace) -> int:
     logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
     lock_path = args.lock_file or default_lock_path(args.state_file)
     running = is_held(lock_path)
-    running_mode = _running_mode(args.status_path) if running else None
+    state = _running_state(args.status_path) if running else {}
+    running_mode = state.get("mode") if state.get("mode") in ("active", "dry_run") else None
+    overrides_mode = state.get("overrides_mode")
+    config_error = state.get("config_error")
     try:
         if args.source == "-":
             candidate = read_candidate(getattr(sys.stdin, "buffer", sys.stdin))
@@ -411,6 +418,8 @@ def cmd_install_override(args: argparse.Namespace) -> int:
         report = install_override(
             candidate, args.config, args.overrides, validate_extra=validate_for_service,
             service_running=running, running_mode=running_mode,
+            running_overrides_mode=overrides_mode if isinstance(overrides_mode, str) else None,
+            running_config_error=config_error if isinstance(config_error, str) else None,
         )
     except (InstallError, OSError) as exc:
         _err(f"override not installed, the live file is unchanged: {exc}")

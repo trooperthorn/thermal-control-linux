@@ -170,8 +170,15 @@ restart and could not be reverted. At the start of every cycle `_poll_reload` al
 when the wall clock passes the active override's expiry, so no file change or signal is
 needed. If that reload cannot retire the override (the file is unreadable, or the main
 config is refused), the controller reloads once more with the overrides file left out, so
-a lowered floor never outlives its end. Reverting is the safe direction: the base
-`min_duty` is never below the overridden one. The audit log gets `override active,
+a lowered floor never outlives its end. If that reload is refused too, the controller
+returns directly to its cached base config (`_revert_override_in_place`). The cache,
+`_base_config`, is loaded again from the main config file when the `Controller` is
+constructed, not taken from `run_service`. If the cache is empty, the base is read from disk
+and held to the same `_restart_required` check as a reload; a base that needs a restart is
+not applied, and the floors stay lowered with an error in the audit log. Reverting does not
+always move a floor up: an override may raise a floor above the base, and that floor then
+falls back to the lower base value at expiry. `expires_at` may not lie beyond the year 9999,
+so every status reader can show it. The audit log gets `override active,
 expires_at=...` when an override is active at start, `config change:` lines with the old
 and new floor, and `override ended (...): base config in use` at expiry. A wall clock
 stepped backwards extends an override until the clock catches up; stepped forwards, it
@@ -191,7 +198,10 @@ Only a file that is applied (not ignored, not expired, not rejected) is moved wi
 leaves the live file as it was. The service records its pid in the lock file
 (`holder_pid`), and the command sends `SIGHUP` only while the lock is held. A missed signal
 costs nothing, because the controller also notices the changed file on its next cycle.
-`check-config` exits 1 for an ignored or expired overrides file, so the same condition
+While the service runs, the command also reads its status file and refuses what
+`Controller.reload` would refuse: a merged mode that differs from the running mode while the
+candidate or the running override sets a mode (`overrides_mode` in the status file), and any
+install while the status file reports a `restart required` config error. `check-config` exits 1 for an ignored or expired overrides file, so the same condition
 that makes install-override refuse also fails a check.
 
 `thermalctl/curves.py` interpolates linearly between points and clamps at both ends.

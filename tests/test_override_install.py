@@ -263,6 +263,75 @@ def test_install_refuses_a_mode_change_when_the_running_mode_is_unknown(
     assert code == 1 and "unknown" in out.err
 
 
+def test_install_refuses_when_the_running_mode_came_from_an_earlier_override(
+    host, capsys, monkeypatch
+):
+    # The base file says dry_run, the service runs active because an override said so. A
+    # floor-only candidate would merge to dry_run, which the reload refuses.
+    put(host.config, MAIN.replace('mode = "active"', 'mode = "dry_run"'))
+    status = host.dir / "status.json"
+    put(status, json.dumps({"mode": "active", "overrides_mode": "active"}))
+    monkeypatch.setattr("thermalctl.cli.is_held", lambda path: True)
+    before = host.live.read_bytes()
+    code, out = run_install(
+        host, "[headers.pwm1]\nmin_duty = 50\n", capsys, monkeypatch,
+        "--status-path", str(status),
+    )
+    assert code == 1 and "needs a restart" in out.err
+    assert host.live.read_bytes() == before and leftovers(host) == []
+
+
+def test_install_refuses_while_the_main_config_holds_a_pending_restart(
+    host, capsys, monkeypatch
+):
+    status = host.dir / "status.json"
+    put(status, json.dumps({
+        "mode": "active", "overrides_mode": None,
+        "config_error": "restart required: header pwm1 path /a->/b",
+    }))
+    monkeypatch.setattr("thermalctl.cli.is_held", lambda path: True)
+    before = host.live.read_bytes()
+    code, out = run_install(
+        host, "[headers.pwm1]\nmin_duty = 50\n", capsys, monkeypatch,
+        "--status-path", str(status),
+    )
+    assert code == 1 and "restart" in out.err
+    assert host.live.read_bytes() == before and leftovers(host) == []
+
+
+@pytest.mark.parametrize("value", ["1e12", "1e300", "253402300800", "9999-12-31T23:59:59-05:00"])
+def test_install_refuses_an_expiry_that_cannot_be_shown(host, capsys, monkeypatch, value):
+    before = host.live.read_bytes()
+    code, out = run_install(
+        host, f"expires_at = {value}\n[headers.pwm1]\nmin_duty = 30\n", capsys, monkeypatch
+    )
+    assert code == 1 and "expires_at" in out.err
+    assert host.live.read_bytes() == before and leftovers(host) == []
+
+
+def test_status_and_check_config_survive_a_huge_expiry(tmp_path, capsys):
+    document = {
+        "timestamp": time.time(), "mode": "active", "config_valid": True,
+        "override_active": True, "override_expires_at": 1e300, "zones": {}, "headers": {},
+    }
+    path = tmp_path / "status.json"
+    put(path, json.dumps(document))
+    assert main(["status", "--status-path", str(path)]) == 0
+    assert "override active" in capsys.readouterr().out
+
+
+def test_expiry_does_not_apply_an_unknown_base_that_needs_a_restart(tmp_path, caplog):
+    rig = Rig(tmp_path, "expires_at = 1010\n[headers.pwm1]\nmin_duty = 20\n")
+    rig.cycle()
+    rig.ctl._base_config = None
+    put(rig.main, MAIN.replace("/fake/pwm1", "/fake/pwm9"))
+    with caplog.at_level(logging.INFO, logger="thermalctl.audit"):
+        doc = rig.cycle(advance=20.0)
+    # The changed path is never applied by the expiry; the failure is loud instead.
+    assert doc["headers"]["pwm1"]["min_duty"] == 20
+    assert any("needs a restart" in r.getMessage() for r in caplog.records)
+
+
 # -- check-config exit code -----------------------------------------------------------
 
 

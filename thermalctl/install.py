@@ -65,6 +65,8 @@ def install_override(
     validate_extra: Callable[[Config], list[str]] | None = None,
     service_running: bool = False,
     running_mode: str | None = None,
+    running_overrides_mode: str | None = None,
+    running_config_error: str | None = None,
 ) -> OverrideReport:
     """Validate and install; return the report of the installed file or raise InstallError."""
     target = Path(overrides_path)
@@ -101,16 +103,30 @@ def install_override(
             problems = validate_extra(merged)
             if problems:
                 raise InstallError("the service would refuse to start: " + "; ".join(problems))
-        # A running service refuses an override that changes its mode (changing mode needs a
-        # restart), so installing one would be accepted here and then ignored on reload.
-        if service_running and report.mode is not None and report.mode != running_mode:
-            known = f"the service runs in {running_mode}" if running_mode else (
-                "the service's running mode is unknown"
-            )
-            raise InstallError(
-                f"the service would refuse this file: mode {report.mode} from overrides needs "
-                f"a restart, and {known}"
-            )
+        # The running service refuses a whole reload in two cases this command can see from
+        # its status file, and then keeps the old override: a merged mode that differs from
+        # the running one while either file sets a mode (Controller.reload), and a pending
+        # change in the main config that needs a restart.
+        if service_running:
+            if running_config_error and running_config_error.startswith("restart required"):
+                raise InstallError(
+                    "the service would refuse this file: the main config holds a change that "
+                    f"needs a restart first ({running_config_error})"
+                )
+            if report.mode is not None and running_mode is None:
+                raise InstallError(
+                    f"the service would refuse this file: mode {report.mode} from overrides "
+                    "needs a restart, and the service's running mode is unknown"
+                )
+            if (
+                running_mode is not None
+                and merged.mode != running_mode
+                and (report.mode is not None or running_overrides_mode is not None)
+            ):
+                raise InstallError(
+                    f"the service would refuse this file: mode {running_mode}->{merged.mode} "
+                    "from overrides needs a restart"
+                )
         os.replace(tmp, target)
     except BaseException:
         try:

@@ -302,17 +302,30 @@ def _insecure_reason(st: os.stat_result) -> str | None:
     return None
 
 
+# The last second of year 9999 (UTC). A later time cannot be shown by every status reader.
+MAX_EXPIRES_AT = 253402300799.0
+
+
+def _check_expiry(epoch: float) -> float:
+    if epoch > MAX_EXPIRES_AT:
+        raise ConfigError("overrides: expires_at is beyond the year 9999")
+    return epoch
+
+
 def _expires_at(value: object) -> float:
     """An expiry as epoch seconds: a TOML datetime with an offset, or a number."""
     if isinstance(value, datetime):
         if value.tzinfo is None:
             raise ConfigError("overrides: expires_at needs a time zone offset, for example Z")
-        return value.timestamp()
+        try:
+            return _check_expiry(value.timestamp())
+        except (OverflowError, OSError, ValueError) as exc:
+            raise ConfigError(f"overrides: expires_at is out of range: {exc}") from exc
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ConfigError("overrides: expires_at must be a datetime with an offset or epoch seconds")
     if not math.isfinite(value) or value <= 0:
         raise ConfigError("overrides: expires_at must be a positive, finite time")
-    return float(value)
+    return _check_expiry(float(value))
 
 
 def _parse_overrides(
