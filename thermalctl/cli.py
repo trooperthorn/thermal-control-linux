@@ -23,7 +23,10 @@ from .backends.sysfs import (
     install_signal_handlers,
     restore_from_state_file,
 )
-from .config import DEFAULT_OVERRIDES_PATH, Config, ConfigError, OverrideReport, load_config, load_effective
+from .config import (
+    DEFAULT_OVERRIDES_PATH, Config, ConfigError, OverrideReport, apply_overrides, load_config,
+    load_effective,
+)
 from .controller import DEFAULT_STATUS_PATH, Controller
 from .hwmon import DEFAULT_HWMON_ROOT, HwmonError, resolve_config
 from .load import SUPPORTED_LOAD_INPUTS, LoadBackend
@@ -145,10 +148,18 @@ def run_service(
 ) -> int:
     notifier = Notifier() if notifier is None else notifier
     try:
-        config, report = load_effective(config_path, overrides_path)
-    except ConfigError as exc:
+        config = load_config(config_path)
+    except Exception as exc:
         _err(f"invalid config, fans stay under firmware control: {exc}")
         return 1
+    # A bad overrides file is not a reason to leave the fans on firmware control: the
+    # main config is valid, so run on it and report the problem in the status file, the
+    # same way a rejected overrides reload does.
+    try:
+        config, report = apply_overrides(config, overrides_path)
+    except Exception as exc:
+        reason = f"overrides rejected, main config used: {exc}"
+        report = OverrideReport(str(overrides_path), ignored=reason)
     if report.ignored:
         _err(f"{report.path}: {report.ignored}")
     elif report.applied:
@@ -195,6 +206,20 @@ def _serve(
 ) -> int:
     if config.mode != "active":
         log.info("mode is dry_run: computing and logging only, no hardware writes")
+    # Install the reload handler before the backend starts: the default action of SIGHUP
+    # ends the process, which would skip the restore of the fan modes. A reload asked for
+    # before the controller exists is passed on as soon as it does.
+    holder: dict[str, Controller] = {}
+    early = {"reload": False}
+
+    def on_hup(signum: int, frame: object) -> None:
+        if "controller" in holder:
+            holder["controller"].request_reload()
+        else:
+            early["reload"] = True
+
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, on_hup)
     sysfs = build_backend(config, state_file)
     install_signal_handlers()
 
@@ -211,9 +236,9 @@ def _serve(
                 overrides_path=overrides_path, config_path=config_path,
                 overrides_report=report,
             )
-            if hasattr(signal, "SIGHUP"):
-                # Reload overrides and config at the next cycle; the handler only sets a flag.
-                signal.signal(signal.SIGHUP, lambda signum, frame: controller.request_reload())
+            holder["controller"] = controller
+            if early["reload"]:
+                controller.request_reload()
             notifier.ready()
             try:
                 controller.run(interval_s, should_stop, sleep=tick)

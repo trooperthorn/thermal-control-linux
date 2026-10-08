@@ -817,3 +817,50 @@ def test_restore_with_config_not_in_active_mode_still_makes_manual_headers_safe(
     assert main(["restore", "--state-file", str(state), "--force", "--config", str(dry)]) == 0
     assert (tree / "pwm1_enable").read_text() == "5\n"
     assert (tree / "pwm1").read_text() == "255\n"
+
+
+# -- reload handler and bad overrides at start ------------------------------------------
+
+def test_bad_overrides_at_start_run_the_service_and_report_the_error(tmp_path):
+    tree = make_tree(tmp_path)
+    config = write_config(tmp_path, tree, mode="dry_run")
+    bad = tmp_path / "overrides.toml"
+    put(bad, "[headers.pwm9]\nmin_duty = 60\n")
+    status = tmp_path / "status.json"
+    code = cli.run_service(
+        str(config), str(status), str(tmp_path / "state.json"), 1.0,
+        should_stop=status.exists, sleep=lambda s: None,
+        proc_stat=str(write_proc_stat(tmp_path, 100, 900)), overrides_path=str(bad),
+    )
+    assert code == 0
+    doc = json.loads(status.read_text())
+    assert doc["overrides_error"]
+    assert doc["overrides_applied"] is False
+    assert doc["config_valid"] is True
+    assert doc["headers"]["pwm1"]["min_duty"] == 20
+
+
+def test_unreadable_main_config_at_start_still_refuses_to_run(tmp_path):
+    bad = tmp_path / "bad.toml"
+    bad.write_bytes(b"\xff\xfe\x00")
+    code, _status, state = run_cycles(tmp_path, bad, 1)
+    assert code == 1
+    assert not state.exists()
+
+
+def test_sighup_handler_is_installed_before_the_backend_starts(tmp_path, monkeypatch):
+    tree = make_tree(tmp_path)
+    config = write_config(tmp_path, tree, mode="dry_run")
+    events = []
+    monkeypatch.setattr(signal, "SIGHUP", 1, raising=False)
+    monkeypatch.setattr(signal, "signal", lambda signum, handler: events.append(signum))
+    real_build = cli.build_backend
+
+    def build(*args):
+        events.append("backend")
+        return real_build(*args)
+
+    monkeypatch.setattr(cli, "build_backend", build)
+    code, _status, _state = run_cycles(tmp_path, config, 1)
+    assert code == 0
+    assert 1 in events and events.index(1) < events.index("backend")

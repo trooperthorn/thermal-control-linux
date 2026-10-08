@@ -25,7 +25,7 @@ from .config import (
     load_config,
 )
 from .curves import zone_duty
-from .hwmon import HwmonError
+from .load import SUPPORTED_LOAD_INPUTS
 from .safety import (
     FAILSAFE, FAILSAFE_WRITE_FAILED, LOAD_WARMING_UP, HeaderSafety, Reading, failsafe_duty,
 )
@@ -138,12 +138,16 @@ class Controller:
         # a reload request (SIGHUP) or when the overrides file changes on disk.
         self.config_path = config_path
         self.reload_requested = False
+        # The sensor inputs the backend was started to read. A reload cannot add to them.
+        self._backend_inputs = {z.temperature_input for z in config.zones}
+        # Why the last main config reload was rejected or refused; None when all is well.
+        self.config_error: str | None = None
         report = overrides_report if overrides_report is not None else OverrideReport("")
         self.overrides_applied = report.applied
         self.overrides_mode = report.mode
         # Why the last overrides reload was rejected or ignored; None when all is well.
         self.overrides_error: str | None = report.ignored
-        self._overrides_stamp = self._stat_overrides()
+        self._stamps = self._stat_files()
         self.config_valid = True
         self.config = config
         self.safety: dict[str, HeaderSafety] = {}
@@ -168,11 +172,10 @@ class Controller:
         for header in config.headers:
             machine = HeaderSafety(header, self.hold_s, config.mode == "active")
             prior = old.get(header.id)
-            if prior is not None and prior.state == FAILSAFE:
-                # Never leave failsafe just because the config was reloaded.
-                machine.state = FAILSAFE
-                machine.reasons = prior.reasons
-                machine.last_change = prior.last_change
+            if prior is not None:
+                # Never leave failsafe, and never restart a stall timer, just because the
+                # config was reloaded.
+                machine.adopt(prior)
             self.safety[header.id] = machine
             self.shapers.setdefault(
                 header.id, OutputShaper(self.hysteresis, self.ramp_down_per_s)
@@ -223,6 +226,16 @@ class Controller:
         problems: list[str] = []
         if old.mode == "dry_run" and new.mode == "active":
             problems.append("mode dry_run->active")
+        # The backend reads only the temperature inputs it was started with, so a zone that
+        # moves to another sensor would starve and sit in failsafe for good.
+        for zone in new.zones:
+            if zone.temperature_input not in self._backend_inputs:
+                problems.append(
+                    f"zone {zone.id} temperature_input {zone.temperature_input} is not read "
+                    "by the running backend"
+                )
+            if zone.load_input is not None and zone.load_input not in SUPPORTED_LOAD_INPUTS:
+                problems.append(f"zone {zone.id} load_input {zone.load_input} is not supported")
         old_headers = {h.id: h for h in old.headers}
         for header in new.headers:
             if not header.mapped:
@@ -245,16 +258,22 @@ class Controller:
             new = load_config(path)
             if self.config_transform is not None:
                 new = self.config_transform(new)
-        except (ConfigError, HwmonError) as exc:
-            audit.error("config reload rejected, failsafe stays in force: %s", exc)
+        except Exception as exc:
+            # Not only ConfigError: a file that is not UTF-8, a number too large to parse or
+            # a failed chip lookup is just as unusable, and must never escape as a crash or
+            # be mistaken for a valid file.
+            self.config_error = f"{type(exc).__name__}: {exc}"
+            audit.error("config reload rejected, failsafe stays in force: %s", self.config_error)
             self.config_valid = False
             return False
         # A bad overrides file is not a bad config: the previous effective config stays in
         # force, nothing goes to failsafe, and the reason is published in the status file.
         try:
             new, report = apply_overrides(new, self.overrides_path)
-        except ConfigError as exc:
-            self.overrides_error = str(exc)
+        except Exception as exc:
+            self.overrides_error = str(exc) if isinstance(exc, ConfigError) else (
+                f"{type(exc).__name__}: {exc}"
+            )
             audit.error("overrides rejected, previous effective config kept: %s", exc)
             return False
         if new.mode != self.config.mode and (
@@ -267,9 +286,8 @@ class Controller:
             return False
         blocked = self._restart_required(self.config, new)
         if blocked:
-            audit.error(
-                "config reload refused, restart the service to apply: %s", "; ".join(blocked)
-            )
+            self.config_error = "restart required: " + "; ".join(blocked)
+            audit.error("config reload refused, restart the service to apply: %s", "; ".join(blocked))
             return False
         if not self.config_valid:
             audit.info("config valid again: invalid_config cleared, hold period applies")
@@ -280,18 +298,22 @@ class Controller:
             self.config = new
             self._build(new)
         self.config_valid = True
+        self.config_error = None
         self.overrides_applied = report.applied
         self.overrides_mode = report.mode
         self.overrides_error = report.ignored
         return True
 
-    def _stat_overrides(self) -> tuple[int, int] | None:
-        """A cheap fingerprint of the overrides file, None when it does not exist."""
-        try:
-            st = os.stat(self.overrides_path or DEFAULT_OVERRIDES_PATH)
-        except OSError:
-            return None
-        return (st.st_mtime_ns, st.st_size)
+    def _stat_files(self) -> tuple[tuple[int, int] | None, tuple[int, int] | None]:
+        """Cheap fingerprints of the main config and the overrides file; None when missing."""
+        out = []
+        for path in (self.config_path, self.overrides_path or DEFAULT_OVERRIDES_PATH):
+            try:
+                st = os.stat(path)
+                out.append((st.st_mtime_ns, st.st_size))
+            except (OSError, TypeError, ValueError):
+                out.append(None)
+        return (out[0], out[1])
 
     def request_reload(self) -> None:
         """Ask for a reload at the start of the next cycle; safe to call from a signal handler."""
@@ -300,11 +322,11 @@ class Controller:
     def _poll_reload(self) -> None:
         if self.config_path is None:
             return
-        stamp = self._stat_overrides()
-        if not self.reload_requested and stamp == self._overrides_stamp:
+        stamps = self._stat_files()
+        if not self.reload_requested and stamps == self._stamps:
             return
         self.reload_requested = False
-        self._overrides_stamp = stamp
+        self._stamps = stamps
         try:
             self.reload(self.config_path)
         except Exception:
@@ -501,6 +523,7 @@ class Controller:
             "config_valid": self.config_valid,
             "overrides_applied": self.overrides_applied,
             "overrides_error": self.overrides_error,
+            "config_error": self.config_error,
             "zones": {
                 z.id: {
                     "temperature": val(z.temperature_input),

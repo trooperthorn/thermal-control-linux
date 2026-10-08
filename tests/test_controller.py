@@ -381,15 +381,17 @@ def test_leaving_failsafe_takes_manual_mode_back(tmp_path):
     assert set(rig.backend.retakes) == {"pwm1"}
 
 
-def test_reload_does_not_hide_programming_errors(tmp_path):
+def test_reload_reports_unexpected_errors_and_keeps_failsafe(tmp_path):
+    """An unexpected error is not hidden: the reload fails safe and the type is published."""
     rig = Rig(tmp_path)
 
     def boom(config):
         raise ValueError("bug")
 
     rig.ctl.config_transform = boom
-    with pytest.raises(ValueError):
-        rig.ctl.reload(_write_reload(tmp_path, _reload_text("dry_run", "true")))
+    assert rig.ctl.reload(_write_reload(tmp_path, _reload_text("dry_run", "true"))) is False
+    assert rig.ctl.config_valid is False
+    assert rig.ctl.config_error == "ValueError: bug"
 
 
 class TickingBackend(FakeBackend):

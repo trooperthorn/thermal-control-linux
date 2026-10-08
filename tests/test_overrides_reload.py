@@ -126,7 +126,7 @@ def test_sighup_reloads_without_a_file_change(tmp_path):
     rig.cycle()
     # Same size and a pinned mtime: only the request can trigger the reload.
     put(rig.over, "[headers.pwm1]\nmin_duty = 25\n")
-    os.utime(rig.over, ns=(rig.ctl._overrides_stamp[0],) * 2)
+    os.utime(rig.over, ns=(rig.ctl._stamps[1][0],) * 2)
     assert rig.cycle()["headers"]["pwm1"]["min_duty"] == 30
     rig.ctl.request_reload()
     assert rig.cycle()["headers"]["pwm1"]["min_duty"] == 25

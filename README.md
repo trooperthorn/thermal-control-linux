@@ -66,9 +66,13 @@ of the two points plus a 10 percent margin. The fan sits stopped for up to about
 minute per header, so run it at idle. Nothing is written to the config; copy the values
 in by hand. A change of
 mode, mapping, curve or floor is written to the journal with the old and new values.
-The service reads its config at start. A reload that switches from dry run to active, or
-maps a header or changes a mapped header's path, is refused and logged; restart the service
-to apply those changes.
+The service re-reads its config on `SIGHUP` and whenever the config file's modification time
+or size changes. A reload that switches from dry run to active, maps a header, changes a
+mapped header's path or moves a zone to a different temperature input is refused and
+logged, and the reason is written to the status file as `config_error` beginning "restart
+required"; restart the service to apply those changes. A config that cannot be read or is
+invalid, for any reason, puts every header in fail-safe, leaves the previous config in
+force and publishes the error as `config_error`, which clears when a good file is read.
 
 ## Overrides file
 
@@ -84,8 +88,10 @@ main config at start and on reload. Any other key is rejected.
 Each header may set `min_duty_limit` in the main config, the lowest floor an override may
 set; it defaults to the header's own `min_duty` and may not be above it. An override below
 the limit, above 100, for an unknown header or for an unmapped header is rejected, and so
-is `mode = "active"` while any header is unmapped. A rejected file is a config error, so
-`run` exits 1 and leaves the fans under firmware control. On POSIX the file must be owned
+is `mode = "active"` while any header is unmapped. A rejected file at start does not stop
+the service: it starts on the main config alone, as for an ignored file below, and the
+reason is in the status file as `overrides_error`. An invalid main config still makes
+`run` exit 1 and leaves the fans under firmware control. On POSIX the file must be owned
 by root and not writable by its group or others; otherwise it is ignored and an error is
 printed. A missing file means no overrides. `check-config` prints whether overrides were
 applied and the effective `min_duty` of every header.

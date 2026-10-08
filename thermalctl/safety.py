@@ -130,6 +130,23 @@ class HeaderSafety:
         self._slow_since: float | None = None
         self._exiting = False
 
+    def adopt(self, prior: "HeaderSafety") -> None:
+        """Take over the running state of the machine this one replaces after a reload.
+
+        The stall, low RPM and slow fan timers measure the physical fan, which a reload
+        does not change, so they carry across. Restarting them on every reload would let a
+        file that changes more often than the stall window hide a dead fan for ever. A
+        header in failsafe stays there with its reasons; its hold period starts again.
+        """
+        self._stall_since = prior._stall_since
+        self._low_rpm_since = prior._low_rpm_since
+        self._slow_since = prior._slow_since
+        self._exiting = prior._exiting
+        if prior.state == FAILSAFE:
+            self.state = FAILSAFE
+            self.reasons = prior.reasons
+            self.last_change = prior.last_change
+
     def request_exit(self) -> None:
         """Latch failsafe; the controller is shutting down."""
         self._exiting = True

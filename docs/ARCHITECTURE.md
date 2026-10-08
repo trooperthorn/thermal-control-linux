@@ -82,7 +82,10 @@ per header, duty, RPM, zone inputs, active curve, fail-safe reasons, last change
 reads that file read-only as a source and raises alerts for fail-safe, stall and over
 temperature. hostwatch does not set targets. The document also carries `overrides_applied`
 (whether an overrides file is part of the effective config), `overrides_error` (null or the
-reason the last overrides reload was rejected) and the effective `min_duty` per header.
+reason the last overrides reload was rejected) and the effective `min_duty` per header. It also
+carries `config_error`: null, or why the last reload of the main config was rejected (an
+unreadable or invalid file, with the exception type) or refused (a change that needs a
+restart).
 
 ## Chip names
 
@@ -139,8 +142,10 @@ applied. A missing file is no overrides. `check-config` prints the effective val
 `Controller.reload` merges the same file over the reloaded main config. When the
 controller is given a `config_path`, `cycle()` first checks for a reload: one is run when
 `request_reload()` was called (the service wires it to `SIGHUP`; the handler only sets a
-flag) or when the overrides file's (mtime, size) fingerprint changed, including appearing
-or disappearing. An overrides `ConfigError` is not a main config error: the previous
+flag, and it is installed before the backend starts so an early signal cannot end the
+process) or when the (mtime, size) fingerprint of the main config file or of the overrides
+file changed, including appearing or disappearing. Any exception while merging the overrides, not only `ConfigError`, is treated this way. An
+overrides error is not a main config error: the previous
 effective config stays in force, no header enters failsafe, and the message is kept in
 `overrides_error`. A reload whose merged mode differs from the running mode while an
 overrides mode is involved is refused the same way, so a mode change from the overrides
@@ -221,17 +226,23 @@ in manual PWM at a low duty. A failsafe on one header resets only the smoothing 
 its own zones.
 
 `Controller.reload(path)` validates a new config (running it through the optional
-`config_transform`, which the CLI uses to resolve chip names; a failure there counts as an
-invalid file). It then refuses, without entering failsafe, any change the running backend
-cannot follow: dry run to active, a header that becomes mapped, or a mapped header whose
-path changes. The old config stays in force, the refusal is logged to `thermalctl.audit`,
+`config_transform`, which the CLI uses to resolve chip names). Any exception while loading
+counts as an invalid file, including a file that is not UTF-8 or holds a number too large
+to parse; the exception type and message are published as `config_error`. It then refuses, without entering failsafe, any change the running backend
+cannot follow: dry run to active, a header that becomes mapped, a mapped header whose
+path changes, or a zone whose temperature input is not one the backend was started to
+read. The backend reads only the inputs of the config it started with, so a zone moved to
+another sensor would sit in failsafe for good; the reload is refused with a
+`config_error` beginning "restart required" and the zone keeps its old sensor. The old config stays in force, the refusal is logged to `thermalctl.audit`,
 `reload` returns False, and the service must be restarted to apply the change. Stopping
 control (active to dry run, unmapping or removing a header) is still accepted and drives
 the header to full speed first. An invalid file sets `config_valid` to
 false, which puts every header in failsafe with `invalid_config`, keeps the old config
 from driving anything, and is logged. Every accepted change of mode, header mapping,
 paths, floors, zones or curves is logged to `thermalctl.audit` with old and new values, as
-is every header state change. `shutdown()` latches failsafe and writes the final status.
+is every header state change. A reload carries the stall, low RPM and slow fan timers
+(and a header's failsafe state and reasons) over to the rebuilt safety machine, so a file
+that changes more often than the stall window cannot hide a stopped fan. `shutdown()` latches failsafe and writes the final status.
 The hold period, EMA alpha, hysteresis, ramp rate and firmware-mode flag are constructor
 arguments; config keys for them are still to do; the CLI uses the defaults.
 
@@ -292,5 +303,5 @@ so it prints the result and the owner sets `mapped = true` by hand.
 library. `run` sends `READY=1` after start, `WATCHDOG=1` once per cycle and `STOPPING=1`
 on the way out. `packaging/thermalctl.service` is `Type=notify` with `WatchdogSec=30`
 against a 2 second cycle, `Restart=always`, a `RuntimeDirectory` holding the status and
-state files, and `ExecStopPost=thermalctl restore --force --config /etc/thermalctl/config.toml`. The config is read at start only;
-there is no reload signal yet.
+state files, and `ExecStopPost=thermalctl restore --force --config /etc/thermalctl/config.toml`. The config and overrides are re-read on `SIGHUP`
+and when either file changes on disk.
