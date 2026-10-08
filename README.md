@@ -112,7 +112,14 @@ in fail-safe if something else changes that header's `pwmN_enable`.
 A fan commanded above 0 percent, including at its floor duty, that reads 0 RPM for longer
 than `stall_window_s` puts its header in fail-safe. A fan reading below `min_rpm` while
 commanded at or above `min_rpm_duty` (default 50 percent) for that window does too. Set
-`min_rpm = 0` for a fan that may legitimately stop, which turns the RPM floor off.
+`min_rpm = 0` for a fan that may legitimately stop, which turns the RPM floor off. A fan
+that turns slower than 100 RPM at any commanded duty above zero, including the idle floor,
+trips fail-safe after the same window (`slow_fan`), unless `min_rpm` is 0.
+
+If the full speed write fails during fail-safe, the header is handed back to firmware
+control and the status file reports the note `failsafe_write_failed`. If the state file
+from a killed run is corrupt, the service puts every mapped header under firmware control,
+keeps the bad file as `state.json.bad`, and starts.
 
 ## hostwatch integration
 

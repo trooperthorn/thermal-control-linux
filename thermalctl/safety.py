@@ -25,6 +25,12 @@ STALE_INPUT = "stale_input"
 OVER_TEMP = "over_temp"
 STALL = "stall"
 LOW_RPM = "low_rpm"
+SLOW_FAN = "slow_fan"
+FAILSAFE_WRITE_FAILED = "failsafe_write_failed"
+# A fan commanded above zero that turns slower than this is nearly stopped. It is far
+# below the lowest speed measured on MediaIn-SVR (see UNVERIFIED.md) and applies at the
+# idle floor, where the min_rpm check does not.
+NEAR_STOP_RPM = 100.0
 LOAD_WARMING_UP = "load_warming_up"
 LOAD_RANGE = (0.0, 100.0)
 INVALID_CONFIG = "invalid_config"
@@ -121,6 +127,7 @@ class HeaderSafety:
         self._clear_since: float | None = None
         self._stall_since: float | None = None
         self._low_rpm_since: float | None = None
+        self._slow_since: float | None = None
         self._exiting = False
 
     def request_exit(self) -> None:
@@ -136,6 +143,7 @@ class HeaderSafety:
         self._clear_since = None
         self._stall_since = None
         self._low_rpm_since = None
+        self._slow_since = None
 
     def _stall_causes(
         self, now: float, commanded: float | None, rpm: float | None
@@ -143,6 +151,7 @@ class HeaderSafety:
         if not _number_ok(rpm) or rpm < 0:
             self._stall_since = None
             self._low_rpm_since = None
+            self._slow_since = None
             return [f"{INVALID_INPUT}:rpm:{self.header.id}"]
         causes: list[str] = []
         # Any commanded duty above zero must turn the fan, including at the floor, where
@@ -167,6 +176,21 @@ class HeaderSafety:
                 causes.append(f"{LOW_RPM}:{self.header.id}")
         else:
             self._low_rpm_since = None
+        # A fan that turns, but barely, passes both checks above at the idle floor. It is
+        # still a failing fan, so a near stop with any duty commanded counts, unless the
+        # owner set min_rpm 0 to say this fan may run that slowly.
+        if (
+            self.header.min_rpm > 0
+            and commanded is not None
+            and commanded > 0
+            and 0 < rpm < NEAR_STOP_RPM
+        ):
+            if self._slow_since is None:
+                self._slow_since = now
+            if now - self._slow_since > self.header.stall_window_s:
+                causes.append(f"{SLOW_FAN}:{self.header.id}")
+        else:
+            self._slow_since = None
         return causes
 
     def update(
@@ -209,6 +233,7 @@ class HeaderSafety:
                 self._clear_since = None
                 self._stall_since = None
                 self._low_rpm_since = None
+                self._slow_since = None
 
 
 def failsafe_duty(firmware_mode: bool) -> float:

@@ -31,6 +31,10 @@ says so. It is entered when any of these hold:
   than the stall window;
 - a header with a non-zero `min_rpm` reports less than that for longer than the stall
   window while commanded at or above its `min_rpm_duty`;
+- a header with a non-zero `min_rpm` and any commanded duty above 0 reports a speed above
+  0 but below 100 RPM (a nearly stopped fan) for longer than the stall window, which
+  catches a failing fan at the idle floor where the check above does not apply (reason
+  `slow_fan:<id>`);
 - an enabled header's `pwmN_enable` no longer holds the value this service set, which
   means something else took the header (reason `external_change:<id>`);
 - the config fails validation;
@@ -161,7 +165,8 @@ in the future, a temperature above `hard_max_temp_c`, an unreadable RPM, 0 RPM w
 commanded duty is above 0 (the floor included) for longer than `stall_window_s`, an RPM below
 a non-zero `min_rpm` while commanded at or above `min_rpm_duty` for longer than
 `stall_window_s` (reason `low_rpm:<id>`; `min_rpm = 0` turns this check off for fans that
-may stop), invalid config, and
+may stop), a speed under 100 RPM with a non-zero `min_rpm` at any commanded duty above 0
+(reason `slow_fan:<id>`), invalid config, and
 exit. Exit latches. For every other cause the header leaves failsafe only after all
 causes have been clear for the hold period, and a new cause restarts that period.
 `failsafe_duty` returns 100, or 0 meaning firmware control when that mode is configured.
@@ -182,13 +187,21 @@ config belongs to the controller slice.
 hardware only through it.
 
 `thermalctl/controller.py` runs one cycle at a time. It reads inputs and RPMs, runs each
-header's state machine, smooths each zone input with an EMA, takes the largest zone duty
+header's state machine, smooths each zone input with an EMA (once per zone per cycle,
+before any header reads it, so headers sharing a zone see the same value and the average
+moves one step per cycle), takes the largest zone duty
 for the header, applies the output shaper and the minimum duty, and writes the result only
 when the config mode is `active` and the header is mapped. In dry run it never calls a
 backend write. Any exception in a cycle forces failsafe on every header with a
 `cycle_error:<type>` reason, writes full speed (or releases to firmware) to enabled
 headers, resets smoothing so the duty recovers by ramping down from 100, and the loop
 continues. The next clean cycle starts the hold period, after which headers recover.
+
+If the full speed write (or the manual mode write before it) fails for an enabled header,
+the controller calls `release()` on that header at once, so the chip's own control takes
+over instead of the fan keeping its last low duty. The header reports duty 0, the note
+`failsafe_write_failed`, and an error line in the audit log, and the same attempt is made
+again on every cycle while the header stays in failsafe.
 
 The status file is written every cycle to a temp file in the same directory and renamed
 over the target, so a reader sees the old or the new document and never a partial one. The
@@ -228,7 +241,13 @@ reading with no value, which the safety machine treats as a missing input. An un
 fan file gives an RPM of None.
 
 On `start()` in active mode it reads `pwmN_enable` for every mapped header, saves the
-originals to the state file with an atomic rename, and only then writes manual mode. In
+originals to the state file with an atomic rename, and only then writes manual mode. If
+a state file left by a killed run is truncated, corrupt or untrusted, start does not
+refuse: for every mapped header still in manual mode it writes 255, then writes
+`pwmN_enable` 5 (firmware control, unverified for other chips, see `UNVERIFIED.md`),
+renames the file to `<state file>.bad` for diagnosis, and goes on to record fresh
+originals. A state file that parses but whose restore fails on the hardware still blocks
+start. In
 dry run, or for an unmapped header, it never writes anything. `write_duty` scales the duty
 percent to 0 to 255, clamps it, and treats a non-number as full speed. `restore()` writes
 255 to each pwm file first and then the recorded original `pwmN_enable`. A header whose

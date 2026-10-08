@@ -25,6 +25,10 @@ log = logging.getLogger("thermalctl.sysfs")
 
 MANUAL = 1
 FULL_PWM = 255
+# The pwmN_enable value written when a state file cannot say what the original was. 5 is
+# the value MediaIn-SVR reports for the chip's own control (UNVERIFIED.md), and a chip in
+# that mode cannot hold a stale low duty.
+FIRMWARE_MODE = 5
 
 
 class BackendError(Exception):
@@ -110,7 +114,11 @@ class SysfsBackend:
             try:
                 fallbacks = restore_from_state_file(self.state_file)
             except StateFileError as exc:
-                raise BackendError(f"stale state file blocks start: {exc}") from exc
+                # A truncated or corrupt file names no usable originals, and refusing to
+                # start would leave every fan in manual mode at its last low duty. Put each
+                # mapped header back under firmware control, set the file aside, and go on.
+                self._recover_from_bad_state_file(exc)
+                fallbacks = []
             if fallbacks:
                 raise BackendError(
                     "stale state file could not be fully restored for "
@@ -128,6 +136,31 @@ class SysfsBackend:
         except (OSError, ValueError) as exc:
             self.restore()
             raise BackendError(f"cannot take control of fans: {exc}") from exc
+
+    def _recover_from_bad_state_file(self, exc: StateFileError) -> None:
+        """Hand every mapped header to firmware control without the saved originals.
+
+        A header still in manual mode gets full speed first, so that if the mode write
+        fails the fan is not left at a stale low duty. The bad file is renamed to keep it
+        for diagnosis, so the next start does not read it again.
+        """
+        log.error("state file unusable (%s); restoring every mapped header to firmware mode", exc)
+        for header_id in sorted(self.mapped):
+            pwm = self.headers[header_id]
+            try:
+                if int(_read_text(_enable_path(pwm))) == MANUAL:
+                    _write_int(pwm, FULL_PWM)
+            except (OSError, ValueError) as err:
+                log.error("full speed write to %s failed: %s", header_id, err)
+            try:
+                _write_int(_enable_path(pwm), FIRMWARE_MODE)
+            except OSError as err:
+                log.error("firmware mode write to %s failed: %s; fan left at full speed", header_id, err)
+        bad = self.state_file.with_name(self.state_file.name + ".bad")
+        try:
+            os.replace(self.state_file, bad)
+        except OSError as err:
+            log.error("cannot set aside state file %s: %s", self.state_file, err)
 
     def restore(self) -> None:
         """Write full speed, then restore every recorded pwmN_enable.

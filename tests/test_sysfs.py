@@ -163,13 +163,27 @@ def test_stale_state_file_restored_before_recording(tree, tmp_path):
     assert not (tmp_path / "state.json").exists()
 
 
-def test_unreadable_state_file_blocks_start(tree, tmp_path):
-    (tmp_path / "state.json").write_text("{not json", encoding="utf-8")
+@pytest.mark.parametrize("content", ["{not json", '{"headers": {"p1"', "[]", ""])
+def test_corrupt_state_file_restores_to_firmware_and_starts(tree, tmp_path, content):
+    """A bad state file must never leave fans in manual mode or stop the service starting."""
+    state = tmp_path / "state.json"
+    first = make(tree, tmp_path)
+    first.start()  # a killed run: manual mode set at the old duty
+    first.write_duty("p1", 20.0)
+    state.write_text(content, encoding="utf-8")  # the kill truncated the state file
+    assert text(tree / "pwm1_enable") == "1"
     b = make(tree, tmp_path)
-    with pytest.raises(BackendError):
-        b.start()
+    b.start()
+    # Both mapped headers went to firmware mode first, so none kept a stale low duty.
+    assert text(tree / "pwm1") == "255"
+    assert text(tree / "pwm2") == "255"
+    assert (tmp_path / "state.json.bad").read_text(encoding="utf-8") == content
+    # The service then took control normally and recorded fresh originals.
+    assert b.originals == {"p1": 5, "p2": 5}
+    assert json.loads(state.read_text(encoding="utf-8"))["originals"] == {"p1": 5, "p2": 5}
+    b.restore()
     assert text(tree / "pwm1_enable") == "5"
-    assert (tmp_path / "state.json").read_text(encoding="utf-8") == "{not json"
+    assert not state.exists()
 
 
 def test_stale_restore_failure_blocks_start(tree, tmp_path):

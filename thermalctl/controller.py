@@ -26,7 +26,9 @@ from .config import (
 )
 from .curves import zone_duty
 from .hwmon import HwmonError
-from .safety import FAILSAFE, LOAD_WARMING_UP, HeaderSafety, Reading, failsafe_duty
+from .safety import (
+    FAILSAFE, FAILSAFE_WRITE_FAILED, LOAD_WARMING_UP, HeaderSafety, Reading, failsafe_duty,
+)
 from .smoothing import Ema, OutputShaper, apply_floor
 
 DEFAULT_STATUS_PATH = "/run/thermalctl/status.json"
@@ -308,20 +310,52 @@ class Controller:
 
     # -- one cycle ----------------------------------------------------------------
 
-    def _header_duty(self, header: Header, readings: dict[str, Reading], dt: float) -> float:
+    def _smooth_zones(
+        self, readings: dict[str, Reading]
+    ) -> dict[str, tuple[float, float | None, bool]]:
+        """Advance each zone's smoothing once for this cycle.
+
+        Several headers can share a zone. Each zone is updated here once, and every header
+        reads the result, so the average moves one step per cycle and not one per header.
+        Only zones used by a header that is not in failsafe are advanced.
+        """
+        used = {
+            zid
+            for header in self.config.headers
+            if self.safety[header.id].state != FAILSAFE
+            for zid in header.zones
+        }
+        smoothed: dict[str, tuple[float, float | None, bool]] = {}
+        for zone in self.config.zones:
+            if zone.id not in used:
+                continue
+            temp = self.emas[(zone.id, zone.temperature_input)].update(
+                readings[zone.temperature_input].value
+            )
+            load = None
+            warming = False
+            if zone.load_input is not None and readings[zone.load_input].warming_up:
+                warming = True
+            elif zone.load_input is not None:
+                load = self.emas[(zone.id, zone.load_input)].update(
+                    readings[zone.load_input].value
+                )
+            smoothed[zone.id] = (temp, load, warming)
+        return smoothed
+
+    def _header_duty(
+        self,
+        header: Header,
+        smoothed: dict[str, tuple[float, float | None, bool]],
+        dt: float,
+    ) -> float:
         warming = False
         zones = {z.id: z for z in self.config.zones}
         target = 0.0
         for zid in header.zones:
             zone = zones[zid]
-            temp = self.emas[(zid, zone.temperature_input)].update(
-                readings[zone.temperature_input].value
-            )
-            load = None
-            if zone.load_input is not None and readings[zone.load_input].warming_up:
-                warming = True
-            elif zone.load_input is not None:
-                load = self.emas[(zid, zone.load_input)].update(readings[zone.load_input].value)
+            temp, load, zone_warming = smoothed[zid]
+            warming = warming or zone_warming
             target = max(target, zone_duty(zone.temperature_curve, temp, zone.load_curve, load))
         self.notes[header.id] = [LOAD_WARMING_UP] if warming else []
         # The floor goes in before the shaper so that lowering it ramps down at the normal
@@ -354,6 +388,26 @@ class Controller:
                     self.backend.write_duty(header.id, duty)
             except Exception:
                 log.exception("failsafe write failed for %s", header.id)
+                self._hand_to_firmware(header)
+
+    def _hand_to_firmware(self, header: Header) -> None:
+        """The full speed write failed, so give the header back to the chip and say so.
+
+        A header left in manual mode keeps its last duty, which may be low. Firmware
+        control is the only other state that cannot leave the fan slow, so try it, make the
+        status file and the audit log report that full speed was not written, and never
+        claim a duty the fan does not have.
+        """
+        audit.error(
+            "header %s failsafe write failed, handing the header to firmware control", header.id
+        )
+        try:
+            self.backend.release(header.id)
+        except Exception:
+            log.exception("release after failed failsafe write also failed for %s", header.id)
+        self.duty[header.id] = 0.0
+        self.commanded[header.id] = None
+        self.notes[header.id] = [FAILSAFE_WRITE_FAILED]
 
     def _force_failsafe_all(self, now: float, reason: str) -> None:
         for header in self.config.headers:
@@ -392,14 +446,19 @@ class Controller:
                     commanded=self.commanded.get(header.id),
                     config_valid=self.config_valid,
                 )
+            # Failsafe headers go first. They reset the smoothing of their zones, which must
+            # happen before the healthy headers advance the same zones for this cycle.
             for header in self.config.headers:
                 if self.safety[header.id].state == FAILSAFE:
                     self._failsafe_header(header)
+            smoothed = self._smooth_zones(readings)
+            for header in self.config.headers:
+                if self.safety[header.id].state == FAILSAFE:
                     continue
                 if previous.get(header.id) == FAILSAFE and self._enabled(header):
                     # Leaving failsafe: release() may have handed the header to firmware.
                     self.backend.retake(header.id)
-                duty = self._header_duty(header, readings, dt)
+                duty = self._header_duty(header, smoothed, dt)
                 self.duty[header.id] = duty
                 self.commanded[header.id] = duty
                 if self._enabled(header):
