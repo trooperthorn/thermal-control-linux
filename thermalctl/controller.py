@@ -619,6 +619,12 @@ class Controller:
         except Exception:
             return False
 
+    def _released(self, header: Header) -> bool:
+        try:
+            return bool(self.backend.released(header.id))
+        except Exception:
+            return False
+
     def _hold_failsafe(self, header: Header, duty: float) -> None:
         """Write the failsafe state once, then only verify it with reads.
 
@@ -630,7 +636,11 @@ class Controller:
         target = duty_to_pwm(duty) if duty != 0.0 else _RELEASED
         previous = self._applied.get(header.id)
         if previous is not None and previous[0] == target and previous[1] + 1 < self.refresh_cycles:
-            verified = self._owned_now(header) and (target == _RELEASED or self._holds(header, duty))
+            # A release is verified by the backend: it fails when the mode write failed and,
+            # for a header released into manual mode, when pwmN no longer holds full speed.
+            verified = self._owned_now(header) and (
+                self._released(header) if target == _RELEASED else self._holds(header, duty)
+            )
             if verified:
                 self._applied[header.id] = (target, previous[1] + 1)
                 return

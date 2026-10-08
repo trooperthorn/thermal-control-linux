@@ -99,6 +99,8 @@ class SysfsBackend:
         self.restore_failures: list[str] = []
         # The pwmN_enable value this backend last set per header; anything else is foreign.
         self.expected: dict[str, int] = {}
+        # Headers whose last release did not take effect, so it must be tried again.
+        self.release_failed: set[str] = set()
         self.started = False
         # Per input: the last value read and the clock time it last differed from the one
         # before. A reading is stamped with that time, not with the time of the read.
@@ -254,6 +256,7 @@ class SysfsBackend:
                             log.error("%s left in manual mode at its last duty: %s", header_id, exc)
                             self.restore_failures.append(header_id)
         self.expected = {}
+        self.release_failed = set()
         if not self.restore_failures:
             self.originals = {}
             try:
@@ -354,6 +357,21 @@ class SysfsBackend:
         except (OSError, ValueError):
             return False
 
+    def released(self, header_id: str) -> bool:
+        """True when the last release took effect and the header is still safe.
+
+        False after a release whose mode write failed, so the caller releases again. When
+        the header was released into manual mode (its original mode) it also checks that
+        pwmN still holds full speed, because a manual header keeps whatever duty is written.
+        """
+        if not self._controlled(header_id):
+            return True
+        if header_id in self.release_failed:
+            return False
+        if self.expected.get(header_id) == MANUAL:
+            return self.holds(header_id, 100.0)
+        return True
+
     def retake(self, header_id: str) -> None:
         """Write manual mode again after a foreign change, so duty writes take effect."""
         if not self._controlled(header_id):
@@ -361,6 +379,7 @@ class SysfsBackend:
         previous = self.expected.get(header_id)
         _write_int(_enable_path(self.headers[header_id]), MANUAL)
         self.expected[header_id] = MANUAL
+        self.release_failed.discard(header_id)
         if previous != MANUAL:
             audit.warning("header %s mode %s to %s (retaken)", header_id, previous, MANUAL)
 
@@ -379,9 +398,11 @@ class SysfsBackend:
                 log.error("full speed write to %s failed: %s; trying firmware mode", header_id, exc)
                 target = FIRMWARE_MODE
         previous = self.expected.get(header_id)
+        self.release_failed.add(header_id)
         try:
             _write_int(_enable_path(pwm), target)
             self.expected[header_id] = target
+            self.release_failed.discard(header_id)
             if previous != target:
                 audit.warning("header %s mode %s to %s (released)", header_id, previous, target)
         except OSError as exc:

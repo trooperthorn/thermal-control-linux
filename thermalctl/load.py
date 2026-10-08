@@ -97,6 +97,9 @@ class LoadBackend:
     def owns(self, header_id: str) -> bool:
         return self.inner.owns(header_id)
 
+    def released(self, header_id: str) -> bool:
+        return self.inner.released(header_id)
+
     def holds(self, header_id: str, duty: float) -> bool:
         return self.inner.holds(header_id, duty)
 

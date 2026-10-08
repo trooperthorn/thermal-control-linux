@@ -29,6 +29,13 @@ class Backend(Protocol):
     def owns(self, header_id: str) -> bool:
         """False when something else changed the header's mode since this service set it."""
 
+    def released(self, header_id: str) -> bool:
+        """True when the last release took effect and the header is still safe.
+
+        False when the release failed, or when the header was released into manual mode
+        and its duty register no longer holds full speed. One read at most, no write.
+        """
+
     def holds(self, header_id: str, duty: float) -> bool:
         """True when the header's duty register still holds the value a write of duty makes.
 
@@ -55,6 +62,8 @@ class FakeBackend:
         # changes it directly to play another program rewriting the duty.
         self.pwm: dict[str, int] = {}
         self.holds_calls: list[str] = []
+        # Set by a test to play a release that did not take effect.
+        self.unreleased: set[str] = set()
 
     def read_inputs(self) -> Mapping[str, Reading]:
         if self.fail_reads:
@@ -73,6 +82,9 @@ class FakeBackend:
 
     def owns(self, header_id: str) -> bool:
         return header_id not in self.foreign
+
+    def released(self, header_id: str) -> bool:
+        return header_id not in self.unreleased
 
     def holds(self, header_id: str, duty: float) -> bool:
         self.holds_calls.append(header_id)

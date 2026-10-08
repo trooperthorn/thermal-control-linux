@@ -272,14 +272,19 @@ write is also forced every `FORCE_REFRESH_CYCLES` (60, two minutes at the defaul
 second interval) to correct any drift a read cannot show; `Controller(refresh_cycles=)`
 sets it. In failsafe the controller writes manual mode and 255 (or releases to firmware)
 once. On the following cycles it only verifies: the ownership read and, for full speed,
-the `holds` read. A changed mode or value repeats the write at once, and the write also
-repeats at the forced refresh. Leaving failsafe takes the header back and writes the new
+the `holds` read. For a release, the backend's `released` check replaces `holds`: it fails
+when the mode write of the release failed (so a failed release is retried every cycle, as
+before) and, for a header whose original mode is manual, when `pwmN` no longer holds full
+speed. A changed mode or value repeats the write at once, and the write also repeats at the
+forced refresh. A release into an automatic firmware mode has no duty to read back, so
+only the mode is verified there. Leaving failsafe takes the header back and writes the new
 duty once. Reloading a config, or dropping a header, clears the records so the next
 cycle writes afresh.
 
-The `pwmN_enable` ownership read stays at one per enabled header per cycle: it is the
-only way to see an external mode change within one cycle, so it is not thinned out. The
-failsafe verification reuses that same read instead of making a second one. Measured on
+The `pwmN_enable` ownership read is not reduced: it stays at one per enabled header per
+cycle, because it is the only way to see an external mode change within one cycle. Failsafe
+now also uses that read for its verification, so the read count is unchanged and no read
+was saved. Measured on
 the fake backend over 600 cycles of a steady 60 C with two headers: 600 writes per header
 before (30 a minute), 10 after (0.5 a minute), with about one verification read per
 header per cycle. A failsafe held for 20 cycles took 20 `pwmN_enable` writes and 20

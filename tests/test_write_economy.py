@@ -66,9 +66,9 @@ def test_steady_state_writes_are_a_tenth_of_one_per_cycle(tmp_path):
     for hid in ("pwm1", "pwm2"):
         count = len(writes_to(backend, hid))
         per_minute = count / (cycles * INTERVAL_S / 60.0)
-        assert count <= cycles / 10
-        assert per_minute <= 3.0  # a tenth of the 30 a minute before
-        assert count >= 2  # the forced refresh still happens
+        # The first write plus a forced refresh every FORCE_REFRESH_CYCLES, exactly.
+        assert count == 1 + (cycles - 1) // FORCE_REFRESH_CYCLES == 10
+        assert per_minute == 0.5  # against 30 a minute before, a sixtieth
     assert backend.retakes == []
 
 
@@ -112,11 +112,15 @@ def test_steady_state_writes_on_a_real_sysfs_tree(tmp_path, monkeypatch):
         def release(self, header_id):
             sysfs.release(header_id)
 
+        def released(self, header_id):
+            return sysfs.released(header_id)
+
     ctl, cycle = build(tmp_path, Wrapped())
     cycles = 310  # past the forced refresh at cycle 301, so the next one is far off
     for _ in range(cycles):
         cycle()
-    assert len(pwm_writes) <= 2 * cycles / 10
+    # Six writes per header: the first and the refreshes at cycles 61, 121, 181, 241, 301.
+    assert len(pwm_writes) == 12
     assert enable_writes == []
     # An external pwm change is put back within one cycle.
     (tree / "pwm1").write_text("3\n", encoding="ascii")
@@ -281,3 +285,94 @@ def test_sysfs_holds_reports_value_drift_and_unreadable_files(tmp_path):
     assert sysfs.holds("pwm2", 100.0)  # not controlled: nothing to check
     (tree / "pwm1").write_text("0\n", encoding="ascii")
     sysfs.restore()
+
+
+def _sysfs_tree(tmp_path, original_mode):
+    tree = tmp_path / "hw"
+    tree.mkdir()
+    (tree / "pwm1").write_text("128\n", encoding="ascii")
+    (tree / "pwm1_enable").write_text(f"{original_mode}\n", encoding="ascii")
+    sysfs = SysfsBackend(
+        {"pwm1": str(tree / "pwm1")}, {}, ["pwm1"], tmp_path / "state.json", active=True,
+    )
+    sysfs.start()
+    return tree, sysfs
+
+
+class _RealRelease(FakeBackend):
+    """Fake inputs over a real sysfs backend, for the firmware failsafe paths."""
+
+    def __init__(self, sysfs):
+        super().__init__()
+        self.sysfs = sysfs
+
+    def write_duty(self, header_id, duty):
+        self.sysfs.write_duty(header_id, duty)
+
+    def holds(self, header_id, duty):
+        return self.sysfs.holds(header_id, duty)
+
+    def owns(self, header_id):
+        return self.sysfs.owns(header_id)
+
+    def retake(self, header_id):
+        self.sysfs.retake(header_id)
+
+    def release(self, header_id):
+        self.releases.append(header_id)
+        self.sysfs.release(header_id)
+
+    def released(self, header_id):
+        return self.sysfs.released(header_id)
+
+
+def test_firmware_failsafe_into_manual_original_corrects_a_lowered_value(tmp_path):
+    tree, sysfs = _sysfs_tree(tmp_path, 1)  # the original mode is manual
+    backend = _RealRelease(sysfs)
+    ctl, cycle = build(tmp_path, backend, headers=("pwm1",), failsafe_firmware=True)
+    cycle()
+    cycle(120.0)
+    assert (tree / "pwm1").read_text().strip() == "255"
+    assert backend.releases == ["pwm1"]
+    cycle(120.0)
+    assert backend.releases == ["pwm1"]  # verified by reads, no rewrite
+    (tree / "pwm1").write_text("10\n", encoding="ascii")  # another program lowers it
+    cycle(120.0)
+    assert backend.releases == ["pwm1", "pwm1"]
+    assert (tree / "pwm1").read_text().strip() == "255"
+
+
+def test_firmware_failsafe_retries_a_release_whose_mode_write_failed(tmp_path, monkeypatch):
+    tree, sysfs = _sysfs_tree(tmp_path, 5)
+    backend = _RealRelease(sysfs)
+    ctl, cycle = build(tmp_path, backend, headers=("pwm1",), failsafe_firmware=True)
+    cycle()
+    real = sysfs_module._write_int
+    failing = {"on": True}
+
+    def flaky(path, value):
+        if failing["on"] and path.endswith("_enable"):
+            raise OSError(5, "Input/output error")
+        return real(path, value)
+
+    monkeypatch.setattr(sysfs_module, "_write_int", flaky)
+    cycle(120.0)
+    cycle(120.0)
+    cycle(120.0)
+    assert backend.releases == ["pwm1"] * 3  # retried every cycle while it keeps failing
+    failing["on"] = False
+    cycle(120.0)
+    assert backend.releases == ["pwm1"] * 4
+    assert (tree / "pwm1_enable").read_text().strip() == "5"
+    cycle(120.0)
+    assert backend.releases == ["pwm1"] * 4  # now verified, no further writes
+
+
+def test_failsafe_release_that_did_not_take_effect_is_retried(tmp_path):
+    backend = FakeBackend()
+    ctl, cycle = build(tmp_path, backend, headers=("pwm1",), failsafe_firmware=True)
+    cycle()
+    backend.unreleased.add("pwm1")
+    for _ in range(3):
+        cycle(120.0)
+    assert backend.releases == ["pwm1"] * 3
