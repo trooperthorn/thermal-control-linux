@@ -274,7 +274,9 @@ def load_config(path: str | Path) -> Config:
             data = tomllib.load(handle)
     except OSError as exc:
         raise ConfigError(f"cannot read config: {exc}") from exc
-    except tomllib.TOMLDecodeError as exc:
+    except UnicodeDecodeError:
+        raise
+    except ValueError as exc:  # TOMLDecodeError, or an integer too long for Python to parse
         raise ConfigError(f"config is not valid TOML: {exc}") from exc
     return parse_config(data)
 
@@ -338,6 +340,12 @@ def _expires_at(value: object) -> float:
             raise ConfigError(f"overrides: expires_at is out of range: {exc}") from exc
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ConfigError("overrides: expires_at must be a datetime with an offset or epoch seconds")
+    if isinstance(value, int):
+        # Checked as an integer: float() of a huge int raises OverflowError.
+        if value <= 0:
+            raise ConfigError("overrides: expires_at must be a positive, finite time")
+        if value > MAX_EXPIRES_AT:
+            raise ConfigError("overrides: expires_at is beyond the year 9999")
     if not math.isfinite(value) or value <= 0:
         raise ConfigError("overrides: expires_at must be a positive, finite time")
     return _check_expiry(float(value))
@@ -419,7 +427,9 @@ def apply_overrides(
             data = tomllib.load(handle)
     except OSError as exc:
         raise ConfigError(f"cannot read overrides: {exc}") from exc
-    except tomllib.TOMLDecodeError as exc:
+    except UnicodeDecodeError:
+        raise
+    except ValueError as exc:  # TOMLDecodeError, or an integer too long for Python to parse
         raise ConfigError(f"overrides are not valid TOML: {exc}") from exc
     mode, floors, expires_at = _parse_overrides(data, config)
     if expires_at is not None and (time.time() if now is None else now) >= expires_at:

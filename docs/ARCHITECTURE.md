@@ -185,7 +185,7 @@ constructed, not taken from `run_service`. If the cache is empty, the base is re
 and held to the same `_restart_required` check as a reload; a base that needs a restart is
 not applied, and the floors stay lowered with an error in the audit log. Reverting does not
 always move a floor up: an override may raise a floor above the base, and that floor then
-falls back to the lower base value at expiry. `expires_at` may not lie beyond the year 9999,
+falls back to the lower base value at expiry. `expires_at` may not lie beyond the year 9999 (an integer too large for Python to parse, or to convert to a float, is a validation error, not a crash),
 so every status reader can show it. The audit log gets `override active,
 expires_at=...` when an override is active at start, `config change:` lines with the old
 and new floor, and `override ended (...): base config in use` at expiry. A wall clock
@@ -341,18 +341,21 @@ its own zones.
 counts as an invalid file, including a file that is not UTF-8 or holds a number too large
 to parse; the exception type and message are published as `config_error`. It then refuses, without entering failsafe, any change the running backend
 cannot follow: dry run to active, a header that becomes mapped, a mapped header whose
-path changes, or a zone whose temperature input is not one the backend was started to
-read. The backend reads only the inputs of the config it started with, so a zone moved to
+path changes, or a zone whose temperature input is not one the backend
+was started to read. The backend reads only the inputs of the config it started with, so a zone moved to
 another sensor would sit in failsafe for good; the reload is refused with a
 `config_error` beginning "restart required" and the zone keeps its old sensor. The old config stays in force, the refusal is logged to `thermalctl.audit`,
-`reload` returns False, and the service must be restarted to apply the change. Stopping
+`reload` returns False, and the service must be restarted to apply the change. An unmapped header added by a
+reload is accepted: the backend never read its fan, so it is not judged on an RPM reading
+and does not sit in failsafe for want of one. Stopping
 control (active to dry run, unmapping or removing a header) is still accepted and drives
 the header to full speed first. An invalid file sets `config_valid` to
 false, which puts every header in failsafe with `invalid_config`, keeps the old config
-from driving anything, and is logged. Every accepted change of mode, header mapping,
-paths, floors, zones or curves is logged to `thermalctl.audit` with old and new values, as
-is every header state change. A reload carries the stall, low RPM and slow fan timers
-(and a header's failsafe state and reasons) over to the rebuilt safety machine, so a file
+from driving anything, and is logged. Every accepted change of mode or of any field of
+a header or zone (taken from the dataclasses, so `min_duty_limit`, the plausible range and
+any later field are included) is logged to `thermalctl.audit` with old and new values, as
+is every header state change. A reload carries the stall, low RPM and slow fan timers, the
+time of the last state change (and a header's failsafe state and reasons) over to the rebuilt safety machine, so a file
 that changes more often than the stall window cannot hide a stopped fan. `shutdown()` latches failsafe and writes the final status.
 The hold period, EMA alpha, hysteresis, ramp rate and firmware-mode flag are constructor
 arguments; config keys for them are still to do; the CLI uses the defaults.
@@ -377,7 +380,10 @@ originals. A state file that parses but whose restore fails on the hardware stil
 start. In
 dry run, or for an unmapped header, it never writes anything. `write_duty` scales the duty
 percent to 0 to 255, clamps it, and treats a non-number as full speed. `restore()` writes
-255 to each pwm file first and then the recorded original `pwmN_enable`. A header whose
+255 to each pwm file first and then the recorded original `pwmN_enable`. The 255 is
+written when the header is in manual mode now, and also whenever the original mode is
+manual, whatever the current mode is, because the fan keeps the duty in pwmN once mode 1 is
+back. A chip that refuses the write in an automatic mode is retried after the mode write. A header whose
 original mode was manual (1) is therefore left at full speed, not at the last low duty;
 it stays at full speed until something sets it again. If the mode write fails the 255
 already written stands, and the state file is kept when any header fell back. The backend is a context manager so

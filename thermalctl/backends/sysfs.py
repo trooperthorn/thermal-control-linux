@@ -223,6 +223,7 @@ class SysfsBackend:
             # Full speed goes in first. If the original mode is manual (1) the fan keeps
             # this duty after the restore, so it must never be the last low value.
             full_speed_written = True
+            manual_original = original == MANUAL
             # A header already back in a firmware mode (for example after the mapping test
             # released it) is controlled by the chip, which refuses pwm writes with EBUSY on
             # nct6775. There is nothing to make safe, so skip the write instead of logging a
@@ -232,7 +233,11 @@ class SysfsBackend:
                 current = int(_read_text(_enable_path(pwm)))
             except (OSError, ValueError):
                 current = MANUAL
-            if current == MANUAL:
+            # A manual original is the exception: the fan keeps the duty in pwmN once the mode
+            # is restored, whatever mode it is in now, so full speed is written first even
+            # from an automatic mode. If the chip refuses it, the retry after the mode write
+            # below covers that.
+            if current == MANUAL or manual_original:
                 try:
                     _write_int(pwm, FULL_PWM)
                 except OSError as exc:

@@ -9,6 +9,7 @@ fan slower than it should be or stop the service.
 
 from __future__ import annotations
 
+import dataclasses
 import glob
 import json
 import logging
@@ -23,7 +24,7 @@ from . import __version__
 from .backend import Backend
 from .backends.sysfs import duty_to_pwm
 from .config import (
-    DEFAULT_OVERRIDES_PATH, Config, ConfigError, Header, OverrideReport, apply_overrides,
+    DEFAULT_OVERRIDES_PATH, Config, ConfigError, Header, OverrideReport, Zone, apply_overrides,
     load_config,
 )
 from .curves import zone_duty
@@ -132,11 +133,10 @@ def describe_changes(old: Config | None, new: Config) -> list[str]:
     out: list[str] = []
     if old.mode != new.mode:
         out.append(f"mode={old.mode}->{new.mode}")
-    header_fields = ("mapped", "path", "min_duty", "min_rpm", "stall_window_s", "zones", "min_rpm_duty")
-    zone_fields = (
-        "temperature_input", "temperature_curve", "hard_max_temp_c",
-        "stale_after_s", "frozen_after_s", "load_input", "load_curve",
-    )
+    # Every field of both records is audited, taken from the dataclasses so that a field
+    # added later cannot be left out of the audit by accident.
+    header_fields = tuple(f.name for f in dataclasses.fields(Header) if f.name != "id")
+    zone_fields = tuple(f.name for f in dataclasses.fields(Zone) if f.name != "id")
     for kind, olds, news, fields in (
         ("header", old.headers, new.headers, header_fields),
         ("zone", old.zones, new.zones, zone_fields),
@@ -220,6 +220,10 @@ class Controller:
         self.reload_requested = False
         # The sensor inputs the backend was started to read. A reload cannot add to them.
         self._backend_inputs = {z.temperature_input for z in config.zones}
+        # The headers the backend was started with. It reads the fan speed of these only, so
+        # an unmapped header added by a reload has no fan reading and is not judged on one.
+        # A mapped one is refused by _restart_required as newly mapped.
+        self._backend_headers = {h.id for h in config.headers}
         # Why the last main config reload was rejected or refused; None when all is well.
         self.config_error: str | None = None
         report = overrides_report if overrides_report is not None else OverrideReport("")
@@ -766,6 +770,7 @@ class Controller:
                     zones=[zones[z] for z in header.zones],
                     readings=readings,
                     rpm=rpms[header.id],
+                    rpm_known=header.mapped or header.id in self._backend_headers,
                     commanded=self.commanded.get(header.id),
                     config_valid=self.config_valid,
                 )

@@ -157,10 +157,11 @@ class HeaderSafety:
         self._low_rpm_since = prior._low_rpm_since
         self._slow_since = prior._slow_since
         self._exiting = prior._exiting
+        # The time of the last state change belongs to the fan's history, not to the config.
+        self.last_change = prior.last_change
         if prior.state == FAILSAFE:
             self.state = FAILSAFE
             self.reasons = prior.reasons
-            self.last_change = prior.last_change
 
     def request_exit(self) -> None:
         """Latch failsafe; the controller is shutting down."""
@@ -234,9 +235,13 @@ class HeaderSafety:
         rpm: float | None,
         commanded: float | None,
         config_valid: bool = True,
+        rpm_known: bool = True,
         extra_causes: tuple[str, ...] = (),
     ) -> str:
-        """Evaluate one cycle and return the new state."""
+        """Evaluate one cycle and return the new state.
+
+        rpm_known is False only for an unmapped header the backend does not read.
+        """
         causes: list[str] = []
         if not config_valid:
             causes.append(INVALID_CONFIG)
@@ -244,7 +249,12 @@ class HeaderSafety:
             causes.append(EXITING)
         causes += extra_causes
         causes += input_causes(zones, readings, now)
-        causes += self._stall_causes(now, commanded, rpm)
+        if rpm_known:
+            causes += self._stall_causes(now, commanded, rpm)
+        else:
+            # An unmapped header that no backend ever read has no fan to judge. It is never
+            # driven, so it must not sit in failsafe for want of an RPM reading.
+            self._stall_since = self._low_rpm_since = self._slow_since = None
         self._apply(now, causes)
         return self.state
 
